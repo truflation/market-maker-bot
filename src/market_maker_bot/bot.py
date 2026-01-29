@@ -1,0 +1,1384 @@
+"""
+Main bot orchestrator for the Avellaneda Market Making Bot.
+
+Coordinates all components: pricing, indicators, inventory, and order management.
+"""
+
+import math
+import time
+import logging
+import signal
+from datetime import datetime, time as dt_time
+from typing import Optional, List, Tuple, Dict, Any, Set, TYPE_CHECKING
+from dataclasses import dataclass
+
+# Lazy import TNClient to avoid segfaults when SDK Go bindings aren't available
+# (e.g., in dry-run mode or during testing)
+if TYPE_CHECKING:
+    from trufnetwork_sdk_py.client import TNClient
+
+from .config import BotConfig, MarketConfig, AvellanedaConfig
+from .models import OutcomeMode, Side, PricingResult
+from .market import (
+    MarketContext,
+    OrderManager,
+    build_market_state,
+    convert_price_for_order,
+)
+from .pricing import AvellanedaPricing, InventoryManager, price_binary_option
+from .indicators import (
+    InstantVolatilityIndicator,
+    OrderBookDepthAnalyzer,
+    calculate_stream_volatility,
+    get_current_spot_value,
+)
+from .indicators.volatility import VolatilityTracker
+from .indicators.depth import DepthTracker
+from .execution_state import (
+    ExecutionState,
+    ExecutionTimeframeMode,
+    ExecutionTimeframeConfig,
+    RunAlwaysExecutionState,
+    RunInTimeExecutionState,
+    create_execution_state,
+)
+from .hanging_orders import HangingOrdersTracker, HangingOrder, CreatedPairOfOrders
+from .order_state import OrderStateManager, TrackedOrder
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BotStats:
+    """Runtime statistics for the bot."""
+    orders_placed: int = 0
+    orders_updated: int = 0
+    orders_cancelled: int = 0
+    errors: int = 0
+    cycles: int = 0
+
+
+class AvellanedaMarketMaker:
+    """
+    Avellaneda-Stoikov market making bot for TrufNetwork prediction markets.
+
+    Main loop:
+    1. Poll order book → update volatility indicator
+    2. Refresh inventory periodically
+    3. Estimate kappa from depth
+    4. Calculate A-S prices
+    5. Check order refresh tolerance
+    6. Execute updates using change_bid()/change_ask() when possible
+    """
+
+    def __init__(self, config: BotConfig):
+        """
+        Initialize the market maker.
+
+        Args:
+            config: Bot configuration
+        """
+        self.config = config
+        self._running = False
+        self._shutdown_requested = False
+
+        # Initialize TNClient (lazy loaded to avoid import issues with Go bindings)
+        self._client: Optional["TNClient"] = None
+
+        # Core components
+        self._pricing = AvellanedaPricing(config.avellaneda)
+        self._inventory = InventoryManager(
+            target_pct=config.avellaneda.inventory_target_base_pct
+        )
+        self._volatility_tracker = VolatilityTracker(
+            buffer_size=config.avellaneda.volatility_buffer_size,
+            min_samples=config.avellaneda.volatility_min_samples,
+            default_value=config.avellaneda.default_volatility,
+        )
+        self._depth_tracker = DepthTracker(
+            default_kappa=1.0,  # Dynamic kappa estimated from trading intensity
+            max_levels=5,
+        )
+
+        # Order timing state
+        self._last_fill_time: dict[tuple[int, bool], float] = {}  # (query_id, outcome) -> time
+
+        # Market contexts
+        self._markets: dict[int, MarketContext] = {}
+
+        # Statistics
+        self.stats = BotStats()
+
+        # Timing
+        self._last_inventory_refresh = 0.0
+
+        # Execution state (timeframe control)
+        self._execution_state = self._create_execution_state()
+
+        # Hanging orders tracker (per market/outcome)
+        self._hanging_trackers: dict[tuple[int, bool], HangingOrdersTracker] = {}
+
+        # In-flight cancellations (for should_wait_order_cancel_confirmation)
+        self._in_flight_cancels: Set[str] = set()
+
+        # Order state persistence (for restart recovery)
+        self._order_state = OrderStateManager(config.order_state_file)
+
+    def _create_execution_state(self) -> ExecutionState:
+        """
+        Create execution state from configuration.
+
+        Returns:
+            Appropriate ExecutionState instance based on config
+        """
+        mode_str = self.config.avellaneda.execution_timeframe_mode
+        try:
+            mode = ExecutionTimeframeMode(mode_str)
+        except ValueError:
+            logger.warning(f"Unknown execution mode '{mode_str}', using infinite")
+            mode = ExecutionTimeframeMode.INFINITE
+
+        config = ExecutionTimeframeConfig(mode=mode)
+
+        if mode == ExecutionTimeframeMode.FROM_DATE_TO_DATE:
+            if self.config.avellaneda.execution_start_datetime:
+                config.start_datetime = datetime.fromisoformat(
+                    self.config.avellaneda.execution_start_datetime
+                )
+            if self.config.avellaneda.execution_end_datetime:
+                config.end_datetime = datetime.fromisoformat(
+                    self.config.avellaneda.execution_end_datetime
+                )
+
+        elif mode == ExecutionTimeframeMode.DAILY_BETWEEN_TIMES:
+            if self.config.avellaneda.execution_start_time:
+                config.start_time = dt_time.fromisoformat(
+                    self.config.avellaneda.execution_start_time
+                )
+            if self.config.avellaneda.execution_end_time:
+                config.end_time = dt_time.fromisoformat(
+                    self.config.avellaneda.execution_end_time
+                )
+
+        return create_execution_state(config)
+
+    def _get_hanging_tracker(
+        self, query_id: int, outcome: bool
+    ) -> HangingOrdersTracker:
+        """
+        Get or create hanging orders tracker for a market/outcome.
+
+        Args:
+            query_id: Market ID
+            outcome: True for YES, False for NO
+
+        Returns:
+            HangingOrdersTracker instance
+        """
+        key = (query_id, outcome)
+        if key not in self._hanging_trackers:
+            self._hanging_trackers[key] = HangingOrdersTracker(
+                hanging_orders_cancel_pct=self.config.avellaneda.hanging_orders_cancel_pct,
+                max_order_age=self.config.avellaneda.max_order_age,
+            )
+        return self._hanging_trackers[key]
+
+    def _can_create_orders(self) -> bool:
+        """
+        Check if we can create new orders.
+
+        Respects should_wait_order_cancel_confirmation setting.
+
+        Returns:
+            True if order creation is allowed
+        """
+        if not self.config.avellaneda.should_wait_order_cancel_confirmation:
+            return True
+
+        # Wait for all in-flight cancellations to complete
+        return len(self._in_flight_cancels) == 0
+
+    def _create_proposal_from_order_override(
+        self, mid_price: float
+    ) -> Optional[List[Tuple[str, int, int]]]:
+        """
+        Create order proposals from order_override configuration.
+
+        Args:
+            mid_price: Current mid price in cents
+
+        Returns:
+            List of (side, price, amount) tuples, or None if no override
+        """
+        order_override = self.config.avellaneda.order_override
+        if not order_override:
+            return None
+
+        proposals = []
+        for key, value in order_override.items():
+            if len(value) != 3:
+                logger.warning(f"Invalid order_override entry '{key}': {value}")
+                continue
+
+            side_str, spread_pct, amount = value
+            if side_str not in ["buy", "sell"]:
+                logger.warning(f"Invalid side '{side_str}' in order_override '{key}'")
+                continue
+
+            try:
+                spread_pct = float(spread_pct)
+                amount = int(amount)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid values in order_override '{key}': {value}")
+                continue
+
+            if side_str == "buy":
+                price = int(mid_price * (1 - spread_pct / 100))
+            else:
+                price = int(mid_price * (1 + spread_pct / 100))
+
+            # Clamp to valid range
+            price = max(1, min(99, price))
+
+            if amount > 0 and price > 0:
+                proposals.append((side_str, price, amount))
+
+        return proposals if proposals else None
+
+    def _init_client(self) -> None:
+        """Initialize the TNClient connection."""
+        if self._client is not None:
+            return
+
+        if self.config.dry_run:
+            logger.info("[DRY RUN] Skipping TNClient initialization")
+            return
+
+        # Import TNClient at runtime to avoid segfaults when Go bindings aren't available
+        from trufnetwork_sdk_py.client import TNClient
+
+        logger.info(f"Connecting to {self.config.node_url}")
+        self._client = TNClient(
+            node_url=self.config.node_url,
+            private_key=self.config.private_key,
+        )
+
+    def _setup_signal_handlers(self) -> None:
+        """Set up graceful shutdown handlers."""
+        def handle_shutdown(signum, frame):
+            logger.info(f"Received signal {signum}, initiating shutdown...")
+            self._shutdown_requested = True
+
+        signal.signal(signal.SIGINT, handle_shutdown)
+        signal.signal(signal.SIGTERM, handle_shutdown)
+
+    def _init_markets(self) -> None:
+        """Initialize market contexts from configuration."""
+        for market_config in self.config.markets:
+            if not market_config.enabled:
+                logger.info(f"Skipping disabled market {market_config.query_id}")
+                continue
+
+            context = MarketContext(config=market_config)
+            self._markets[market_config.query_id] = context
+
+            logger.info(
+                f"Initialized market {market_config.query_id} ({market_config.name}) "
+                f"mode={market_config.outcome_mode.value}"
+            )
+
+    def _reconcile_orders_on_startup(self) -> None:
+        """
+        Reconcile tracked orders with the order book on startup.
+
+        This allows the bot to resume managing its own orders after a restart,
+        while ignoring any orders placed manually outside the bot.
+        """
+        if self.config.dry_run:
+            logger.info("[DRY RUN] Skipping order reconciliation")
+            return
+
+        tracked_orders = self._order_state.get_all_orders()
+        if not tracked_orders:
+            logger.info("No tracked orders from previous session")
+            return
+
+        logger.info(f"Reconciling {len(tracked_orders)} tracked orders from previous session...")
+
+        # Group tracked orders by market
+        orders_by_market: Dict[int, List[TrackedOrder]] = {}
+        for order in tracked_orders:
+            if order.query_id not in orders_by_market:
+                orders_by_market[order.query_id] = []
+            orders_by_market[order.query_id].append(order)
+
+        recovered = 0
+        stale = 0
+
+        for query_id, orders in orders_by_market.items():
+            context = self._markets.get(query_id)
+            if context is None:
+                # Market not configured anymore, clear its orders
+                logger.info(f"Market {query_id} no longer configured, clearing tracked orders")
+                self._order_state.clear_market(query_id)
+                stale += len(orders)
+                continue
+
+            # Fetch current order book for this market
+            for outcome in [True, False]:
+                outcome_orders = [o for o in orders if o.outcome == outcome]
+                if not outcome_orders:
+                    continue
+
+                try:
+                    # Get order book from SDK
+                    order_book = self._client.get_order_book(query_id, outcome)
+                    state = build_market_state(order_book)
+                    context.set_state(outcome, state)
+
+                    # Get our tracked prices
+                    for tracked in outcome_orders:
+                        # Check if order is still on the book
+                        is_on_book = False
+                        if tracked.is_buy and state.bids:
+                            is_on_book = any(
+                                entry.price == tracked.price
+                                for entry in state.bids
+                            )
+                        elif not tracked.is_buy and state.asks:
+                            is_on_book = any(
+                                entry.price == tracked.price
+                                for entry in state.asks
+                            )
+
+                        if is_on_book:
+                            # Order is still active - record it in context
+                            side = Side.BID if tracked.is_buy else Side.ASK
+                            order_mgr = OrderManager(
+                                context,
+                                refresh_tolerance_pct=self.config.avellaneda.order_refresh_tolerance_pct,
+                                max_order_age=self.config.avellaneda.max_order_age,
+                            )
+                            order_mgr.record_order(
+                                outcome, side, tracked.price, tracked.amount, tracked.order_id
+                            )
+                            recovered += 1
+                            logger.debug(
+                                f"Recovered order: market {query_id} "
+                                f"{'YES' if outcome else 'NO'} "
+                                f"{'buy' if tracked.is_buy else 'sell'} @{tracked.price}¢"
+                            )
+                        else:
+                            # Order is no longer on the book - was filled or cancelled externally
+                            self._order_state.untrack_order(
+                                query_id, outcome, tracked.is_buy, tracked.price
+                            )
+                            stale += 1
+                            logger.debug(
+                                f"Stale order removed: market {query_id} "
+                                f"{'YES' if outcome else 'NO'} "
+                                f"{'buy' if tracked.is_buy else 'sell'} @{tracked.price}¢"
+                            )
+
+                except Exception as e:
+                    logger.error(f"Failed to reconcile orders for market {query_id}: {e}")
+
+        logger.info(f"Order reconciliation complete: {recovered} recovered, {stale} stale")
+
+    def _calculate_initial_price(
+        self, market_config: MarketConfig
+    ) -> Optional[float]:
+        """
+        Calculate initial price using Black-Scholes when no order book exists.
+
+        Args:
+            market_config: Market configuration with stream info
+
+        Returns:
+            Fair value in cents (1-99), or None if calculation fails
+        """
+        try:
+            # Fetch stream records
+            records = self._client.get_records(
+                stream_id=market_config.stream_id,
+                data_provider=market_config.data_provider,
+            )
+
+            if not records:
+                logger.warning(
+                    f"No stream records for market {market_config.query_id}"
+                )
+                return None
+
+            # Get current spot value
+            spot = get_current_spot_value(records)
+            if spot <= 0:
+                logger.warning(
+                    f"Invalid spot value {spot} for market {market_config.query_id}"
+                )
+                return None
+
+            # Calculate stream volatility
+            vol_result = calculate_stream_volatility(
+                records,
+                hourly_lookback=self.config.avellaneda.stream_volatility_lookback_days,
+                min_volatility=self.config.avellaneda.stream_volatility_min,
+            )
+
+            # For now, assume strike = spot (at-the-money)
+            # In practice, this would come from market metadata
+            strike = spot
+            time_years = 0.25  # Default 3 months expiry
+
+            # Price the binary option
+            bs_result = price_binary_option(
+                spot=spot,
+                strike=strike,
+                time_years=time_years,
+                volatility=vol_result.annual_volatility,
+            )
+
+            # Convert to cents
+            price_cents = max(1, min(99, int(round(bs_result.fair_value * 100))))
+
+            logger.info(
+                f"Market {market_config.query_id}: Black-Scholes initial price "
+                f"spot={spot:.2f} vol={vol_result.annual_volatility:.2%} "
+                f"→ fair_value={bs_result.fair_value:.3f} → {price_cents}¢"
+            )
+
+            return float(price_cents)
+
+        except Exception as e:
+            logger.error(
+                f"Failed to calculate initial price for market {market_config.query_id}: {e}"
+            )
+            return None
+
+    def _refresh_inventory(self) -> None:
+        """Refresh inventory from user positions."""
+        if self.config.dry_run:
+            # Use empty positions in dry-run mode
+            self._inventory.update_from_user_positions([])
+            self._last_inventory_refresh = time.time()
+            logger.debug("[DRY RUN] Using empty inventory")
+            return
+
+        try:
+            positions = self._client.get_user_positions()
+            self._inventory.update_from_user_positions(positions)
+            self._last_inventory_refresh = time.time()
+            logger.debug(f"Refreshed inventory from {len(positions)} positions")
+        except Exception as e:
+            logger.error(f"Failed to refresh inventory: {e}")
+            self.stats.errors += 1
+
+    def _update_order_book(
+        self, context: MarketContext, outcome: bool
+    ) -> bool:
+        """
+        Update order book state for a market outcome.
+
+        Args:
+            context: Market context
+            outcome: True for YES, False for NO
+
+        Returns:
+            True if update successful
+        """
+        try:
+            if self.config.dry_run:
+                # Use mock order book data in dry-run mode
+                # Simulate a market with mid price around 50 cents
+                mock_entries = [
+                    {"price": -48, "amount": 100},  # Bid at 48 cents
+                    {"price": 52, "amount": 100},   # Ask at 52 cents
+                ]
+                entries = mock_entries
+                logger.debug(f"[DRY RUN] Using mock order book for market {context.query_id}")
+            else:
+                entries = self._client.get_order_book(context.query_id, outcome)
+
+            state = build_market_state(
+                query_id=context.query_id,
+                outcome=outcome,
+                order_book_entries=entries,
+            )
+            context.set_state(outcome, state)
+            context.last_order_book_update = time.time()
+
+            # Update volatility indicator if we have mid price
+            if state.mid_price is not None:
+                self._volatility_tracker.add_sample(
+                    context.query_id, outcome, state.mid_price
+                )
+
+            # Update depth tracker
+            self._depth_tracker.update(
+                context.query_id,
+                outcome,
+                state.bid_levels,
+                state.ask_levels,
+                state.mid_price,
+            )
+
+            return True
+
+        except Exception as e:
+            logger.error(
+                f"Failed to update order book for market {context.query_id} "
+                f"outcome={outcome}: {e}"
+            )
+            self.stats.errors += 1
+            return False
+
+    def _calculate_prices(
+        self, context: MarketContext, outcome: bool
+    ) -> Optional[PricingResult]:
+        """
+        Calculate optimal bid/ask prices using Avellaneda-Stoikov.
+
+        Args:
+            context: Market context
+            outcome: True for YES, False for NO
+
+        Returns:
+            PricingResult or None if calculation not possible
+        """
+        # Get mid price (from order book or Black-Scholes fallback)
+        mid_price = context.get_mid_price(outcome)
+        if mid_price is None:
+            logger.warning(
+                f"No mid price available for market {context.query_id} "
+                f"outcome={outcome}"
+            )
+            return None
+
+        # Get volatility
+        vol_estimate = self._volatility_tracker.get_volatility(
+            context.query_id, outcome
+        )
+
+        # Get kappa
+        if self.config.avellaneda.use_dynamic_kappa:
+            kappa = self._depth_tracker.get_kappa(context.query_id, outcome)
+        else:
+            kappa = self.config.avellaneda.default_kappa
+
+        # Get inventory skew
+        inventory_skew = self._inventory.get_inventory_skew(
+            context.query_id, outcome, mid_price
+        )
+
+        # Get market-specific overrides
+        gamma = context.config.gamma or self.config.avellaneda.risk_factor
+
+        # Calculate min_spread: config is percentage of mid price
+        # Convert to cents for binary options
+        min_spread_pct = context.config.min_spread or self.config.avellaneda.min_spread
+        min_spread_cents = mid_price * (min_spread_pct / 100.0) if min_spread_pct > 0 else 0.0
+
+        # Calculate prices
+        result = self._pricing.calculate_from_config(
+            mid_price=mid_price,
+            inventory_skew=inventory_skew,
+            volatility=vol_estimate.value,
+            kappa=kappa,
+            gamma_override=gamma,
+            min_spread_override=min_spread_cents,
+        )
+
+        logger.debug(
+            f"Market {context.query_id} {('YES' if outcome else 'NO')}: "
+            f"mid={mid_price:.1f} vol={vol_estimate.value:.2f}({vol_estimate.source}) "
+            f"κ={kappa:.3f} q={inventory_skew:.2f} "
+            f"→ bid={result.bid_price:.1f} ask={result.ask_price:.1f}"
+        )
+
+        return result
+
+    def _apply_eta_transformation(
+        self, base_amount: int, inventory_skew: float, is_buy: bool
+    ) -> int:
+        """
+        Apply eta transformation to order amount.
+
+        From the Avellaneda-Stoikov paper, eta controls asymmetric order sizing
+        based on inventory. When we have excess inventory (q > 0), we want to
+        reduce buy order sizes. When we have deficit (q < 0), we reduce sell
+        order sizes.
+
+        Formula: size * exp(-eta * q) for orders going against inventory target
+
+        Args:
+            base_amount: Original order amount
+            inventory_skew: q value (-1 to +1), positive = excess inventory
+            is_buy: True for buy orders, False for sell orders
+
+        Returns:
+            Adjusted order amount
+        """
+        eta = self.config.avellaneda.order_amount_shape_factor
+        if eta <= 0:
+            return base_amount
+
+        # Apply eta transformation only for orders against inventory target
+        # q > 0 (excess inventory) → reduce buy size
+        # q < 0 (deficit inventory) → reduce sell size
+        if is_buy and inventory_skew > 0:
+            adjusted = base_amount * math.exp(-eta * inventory_skew)
+        elif not is_buy and inventory_skew < 0:
+            adjusted = base_amount * math.exp(eta * inventory_skew)  # note: q is negative
+        else:
+            adjusted = base_amount
+
+        return max(1, int(round(adjusted)))
+
+    def _apply_order_optimization(
+        self,
+        context: MarketContext,
+        outcome: bool,
+        bid_price: int,
+        ask_price: int,
+    ) -> Tuple[int, int]:
+        """
+        Apply order optimization - cap prices at best bid+1 / best ask-1.
+
+        When enabled, prevents placing orders too aggressively:
+        - Buy orders are capped at best_bid + 1 (don't overpay)
+        - Sell orders are floored at best_ask - 1 (don't undersell)
+
+        This matches Hummingbot's order_optimization behavior.
+
+        Args:
+            context: Market context
+            outcome: True for YES, False for NO
+            bid_price: Proposed bid price
+            ask_price: Proposed ask price
+
+        Returns:
+            Tuple of (optimized_bid, optimized_ask)
+        """
+        if not self.config.avellaneda.order_optimization_enabled:
+            return bid_price, ask_price
+
+        state = context.get_state(outcome)
+        if state is None:
+            return bid_price, ask_price
+
+        optimized_bid = bid_price
+        optimized_ask = ask_price
+
+        # For buys: If our bid price > best_bid + 1, cap it at best_bid + 1
+        # This prevents us from paying more than 1 tick above the best bid
+        if state.best_bid is not None:
+            price_above_bid = state.best_bid + 1
+            if bid_price > price_above_bid:
+                optimized_bid = price_above_bid
+
+        # For sells: If our ask price < best_ask - 1, raise it to best_ask - 1
+        # This prevents us from selling for less than 1 tick below the best ask
+        if state.best_ask is not None:
+            price_below_ask = state.best_ask - 1
+            if ask_price < price_below_ask:
+                optimized_ask = price_below_ask
+
+        # Clamp to valid range
+        optimized_bid = max(1, min(99, optimized_bid))
+        optimized_ask = max(1, min(99, optimized_ask))
+
+        # Ensure bid < ask
+        if optimized_bid >= optimized_ask:
+            # Revert to original prices
+            return bid_price, ask_price
+
+        return optimized_bid, optimized_ask
+
+    def _apply_transaction_costs(
+        self, bid_price: int, ask_price: int, fee_pct: float = 0.0
+    ) -> Tuple[int, int]:
+        """
+        Apply transaction costs to order prices.
+
+        When enabled, adjusts prices to account for trading fees:
+        - Buy price reduced by fee percentage
+        - Sell price increased by fee percentage
+
+        Args:
+            bid_price: Proposed bid price
+            ask_price: Proposed ask price
+            fee_pct: Fee percentage (e.g., 0.1 for 0.1%)
+
+        Returns:
+            Tuple of (adjusted_bid, adjusted_ask)
+        """
+        if not self.config.avellaneda.add_transaction_costs or fee_pct <= 0:
+            return bid_price, ask_price
+
+        # Reduce bid price by fee
+        adjusted_bid = int(bid_price * (1 - fee_pct / 100))
+        # Increase ask price by fee
+        adjusted_ask = int(math.ceil(ask_price * (1 + fee_pct / 100)))
+
+        # Clamp to valid range
+        adjusted_bid = max(1, min(98, adjusted_bid))
+        adjusted_ask = max(2, min(99, adjusted_ask))
+
+        # Ensure bid < ask
+        if adjusted_bid >= adjusted_ask:
+            return bid_price, ask_price
+
+        return adjusted_bid, adjusted_ask
+
+    def _create_order_levels(
+        self, base_bid: int, base_ask: int, optimal_spread: float
+    ) -> List[Tuple[int, int]]:
+        """
+        Create multiple order levels at different price points.
+
+        When order_levels > 1, creates orders at progressively wider spreads.
+
+        Args:
+            base_bid: Base bid price (level 0)
+            base_ask: Base ask price (level 0)
+            optimal_spread: Optimal spread for calculating level distances
+
+        Returns:
+            List of (bid, ask) tuples for each level
+        """
+        order_levels = self.config.avellaneda.order_levels
+        if order_levels <= 1:
+            return [(base_bid, base_ask)]
+
+        level_distances_pct = self.config.avellaneda.level_distances
+        level_step = (optimal_spread / 2) * (level_distances_pct / 100)
+
+        levels = []
+        for i in range(order_levels):
+            level_offset = int(round(i * level_step))
+            bid = max(1, base_bid - level_offset)
+            ask = min(99, base_ask + level_offset)
+
+            if bid < ask:  # Only add valid levels
+                levels.append((bid, ask))
+
+        return levels if levels else [(base_bid, base_ask)]
+
+    def _should_delay_after_fill(
+        self, context: MarketContext, outcome: bool
+    ) -> bool:
+        """
+        Check if we should delay order placement after a recent fill.
+
+        Args:
+            context: Market context
+            outcome: True for YES, False for NO
+
+        Returns:
+            True if we should delay
+        """
+        key = (context.query_id, outcome)
+        last_fill = self._last_fill_time.get(key, 0)
+        delay = self.config.avellaneda.filled_order_delay
+
+        return time.time() - last_fill < delay
+
+    def _record_fill(self, context: MarketContext, outcome: bool) -> None:
+        """Record a fill event for delay tracking."""
+        key = (context.query_id, outcome)
+        self._last_fill_time[key] = time.time()
+
+    def _execute_order_updates(
+        self, context: MarketContext, outcome: bool, pricing: PricingResult
+    ) -> None:
+        """
+        Execute order placements/updates based on pricing result.
+
+        Applies the following transformations in order:
+        1. Check filled order delay
+        2. Apply eta transformation to order amounts
+        3. Apply order optimization (jump to best bid+1 / best ask-1)
+        4. Apply transaction costs
+        5. Create multiple order levels if configured
+
+        Args:
+            context: Market context
+            outcome: True for YES, False for NO
+            pricing: Calculated prices
+        """
+        # Check if we should delay after a recent fill
+        if self._should_delay_after_fill(context, outcome):
+            logger.debug(
+                f"Market {context.query_id}: delaying orders after recent fill"
+            )
+            return
+
+        bid_price, ask_price = pricing.to_int_prices()
+        order_mgr = OrderManager(
+            context,
+            refresh_tolerance_pct=self.config.avellaneda.order_refresh_tolerance_pct,
+            max_order_age=self.config.avellaneda.max_order_age,
+        )
+        base_amount = context.config.order_amount
+
+        # Apply eta transformation to order amounts
+        bid_amount = self._apply_eta_transformation(
+            base_amount, pricing.inventory_skew, is_buy=True
+        )
+        ask_amount = self._apply_eta_transformation(
+            base_amount, pricing.inventory_skew, is_buy=False
+        )
+
+        # Apply order optimization (jump to best bid+1 / best ask-1)
+        bid_price, ask_price = self._apply_order_optimization(
+            context, outcome, bid_price, ask_price
+        )
+
+        # Apply transaction costs (currently no fee info available, placeholder)
+        # In practice, this would use the actual fee from the exchange
+        bid_price, ask_price = self._apply_transaction_costs(
+            bid_price, ask_price, fee_pct=0.0
+        )
+
+        # Create order levels
+        order_levels = self._create_order_levels(
+            bid_price, ask_price, pricing.optimal_spread
+        )
+
+        # Execute orders for each level
+        for level_idx, (level_bid, level_ask) in enumerate(order_levels):
+            # For now, only first level uses the calculated amounts
+            # Additional levels use base amount (could be enhanced)
+            bid_amt = bid_amount if level_idx == 0 else base_amount
+            ask_amt = ask_amount if level_idx == 0 else base_amount
+
+            # Track order pair for hanging orders (first level only)
+            buy_order_info = None
+            sell_order_info = None
+
+            # Update bid
+            buy_result = self._update_single_order(
+                context, outcome, Side.BID, level_bid, bid_amt, order_mgr
+            )
+            if buy_result and self.config.avellaneda.hanging_orders_enabled:
+                buy_order_info = HangingOrder(
+                    order_id=buy_result,
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    is_buy=True,
+                    price=level_bid,
+                    amount=bid_amt,
+                    creation_timestamp=time.time(),
+                )
+
+            # Update ask
+            sell_result = self._update_single_order(
+                context, outcome, Side.ASK, level_ask, ask_amt, order_mgr
+            )
+            if sell_result and self.config.avellaneda.hanging_orders_enabled:
+                sell_order_info = HangingOrder(
+                    order_id=sell_result,
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    is_buy=False,
+                    price=level_ask,
+                    amount=ask_amt,
+                    creation_timestamp=time.time(),
+                )
+
+            # Register pair for hanging order tracking
+            if self.config.avellaneda.hanging_orders_enabled and level_idx == 0:
+                if buy_order_info or sell_order_info:
+                    tracker = self._get_hanging_tracker(context.query_id, outcome)
+                    tracker.add_order_pair(buy_order_info, sell_order_info)
+
+        context.last_order_refresh = time.time()
+
+    def _update_single_order(
+        self,
+        context: MarketContext,
+        outcome: bool,
+        side: Side,
+        new_price: int,
+        amount: int,
+        order_mgr: OrderManager,
+    ) -> Optional[str]:
+        """
+        Update a single order (bid or ask).
+
+        Uses atomic change_bid/change_ask when possible, otherwise
+        cancels and places new order.
+
+        Args:
+            context: Market context
+            outcome: True for YES, False for NO
+            side: Order side
+            new_price: New price in cents (1-99)
+            amount: Order amount
+            order_mgr: Order manager instance
+
+        Returns:
+            Order ID (tx_hash) if order was placed/updated, None otherwise
+        """
+        should_update, reason = order_mgr.should_update_order(
+            outcome, side, new_price
+        )
+
+        if not should_update:
+            logger.debug(
+                f"Market {context.query_id} {side.value}: no update needed ({reason})"
+            )
+            return None
+
+        current_order = order_mgr.get_current_order(outcome, side)
+
+        if self.config.dry_run:
+            logger.info(
+                f"[DRY RUN] Market {context.query_id} {side.value}: "
+                f"would {'update' if current_order else 'place'} "
+                f"@{new_price}¢ x{amount} ({reason})"
+            )
+            return None
+
+        try:
+            if current_order is not None:
+                # Use atomic update
+                old_sdk_price = convert_price_for_order(current_order.price, side)
+                new_sdk_price = convert_price_for_order(new_price, side)
+
+                if side == Side.BID:
+                    tx_hash = self._client.change_bid(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        old_price=old_sdk_price,
+                        new_price=new_sdk_price,
+                        new_amount=amount,
+                        wait=True,
+                    )
+                else:
+                    tx_hash = self._client.change_ask(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        old_price=old_sdk_price,
+                        new_price=new_sdk_price,
+                        new_amount=amount,
+                        wait=True,
+                    )
+
+                order_mgr.record_order(outcome, side, new_price, amount, tx_hash)
+                self.stats.orders_updated += 1
+
+                # Update order state tracking (for restart recovery)
+                self._order_state.update_order(
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    is_buy=(side == Side.BID),
+                    old_price=current_order.price,
+                    new_price=new_price,
+                    amount=amount,
+                    order_id=tx_hash,
+                )
+
+                logger.info(
+                    f"Market {context.query_id} {side.value}: updated "
+                    f"{current_order.price}→{new_price}¢ x{amount} ({reason})"
+                )
+
+                return tx_hash
+
+            else:
+                # Place new order
+                if side == Side.BID:
+                    tx_hash = self._client.place_buy_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        price=new_price,
+                        amount=amount,
+                        wait=True,
+                    )
+                else:
+                    tx_hash = self._client.place_sell_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        price=new_price,
+                        amount=amount,
+                        wait=True,
+                    )
+
+                order_mgr.record_order(outcome, side, new_price, amount, tx_hash)
+                self.stats.orders_placed += 1
+
+                # Track order state (for restart recovery)
+                self._order_state.track_order(
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    is_buy=(side == Side.BID),
+                    price=new_price,
+                    amount=amount,
+                    order_id=tx_hash,
+                )
+
+                logger.info(
+                    f"Market {context.query_id} {side.value}: placed "
+                    f"@{new_price}¢ x{amount}"
+                )
+
+                return tx_hash
+
+        except Exception as e:
+            logger.error(
+                f"Failed to update {side.value} for market {context.query_id}: {e}"
+            )
+            self.stats.errors += 1
+            return None
+
+    def _cancel_market_orders(self, context: MarketContext) -> None:
+        """Cancel all orders for a market during shutdown."""
+        for outcome in [True, False]:
+            orders = context.get_orders(outcome)
+
+            for side, order in [(Side.BID, orders.bid), (Side.ASK, orders.ask)]:
+                if order is None:
+                    continue
+
+                try:
+                    sdk_price = convert_price_for_order(order.price, side)
+                    self._client.cancel_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        price=sdk_price,
+                        wait=True,
+                    )
+                    self.stats.orders_cancelled += 1
+
+                    # Untrack the order
+                    self._order_state.untrack_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        is_buy=(side == Side.BID),
+                        price=order.price,
+                    )
+
+                    logger.info(
+                        f"Cancelled {side.value} for market {context.query_id} "
+                        f"outcome={'YES' if outcome else 'NO'}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to cancel {side.value} for market "
+                        f"{context.query_id}: {e}"
+                    )
+
+    def _process_market(self, context: MarketContext) -> None:
+        """
+        Process a single market for one cycle.
+
+        Args:
+            context: Market context to process
+        """
+        mode = context.config.outcome_mode
+
+        # Determine which outcomes to trade
+        outcomes = []
+        if mode in (OutcomeMode.YES_ONLY, OutcomeMode.BOTH):
+            outcomes.append(True)
+        if mode in (OutcomeMode.NO_ONLY, OutcomeMode.BOTH):
+            outcomes.append(False)
+
+        for outcome in outcomes:
+            # Update order book
+            if not self._update_order_book(context, outcome):
+                continue
+
+            # Process hanging orders if enabled
+            if self.config.avellaneda.hanging_orders_enabled:
+                self._process_hanging_orders(context, outcome)
+
+            # Check if we need initial pricing
+            state = context.get_state(outcome)
+            if state and not state.has_liquidity:
+                if context.get_mid_price(outcome) is None:
+                    initial_price = self._calculate_initial_price(context.config)
+                    if outcome:
+                        context.initial_price_yes = initial_price
+                    else:
+                        context.initial_price_no = initial_price
+
+            # Check for order_override
+            mid_price = context.get_mid_price(outcome)
+            if mid_price is not None:
+                override_proposals = self._create_proposal_from_order_override(mid_price)
+                if override_proposals:
+                    self._execute_order_override(context, outcome, override_proposals)
+                    continue
+
+            # Calculate prices using Avellaneda-Stoikov
+            pricing = self._calculate_prices(context, outcome)
+            if pricing is None:
+                continue
+
+            # Execute order updates
+            self._execute_order_updates(context, outcome, pricing)
+
+    def _process_hanging_orders(
+        self, context: MarketContext, outcome: bool
+    ) -> None:
+        """
+        Process hanging orders for a market/outcome.
+
+        Cancels orders that are too far from price or too old.
+
+        Args:
+            context: Market context
+            outcome: True for YES, False for NO
+        """
+        tracker = self._get_hanging_tracker(context.query_id, outcome)
+        mid_price = context.get_mid_price(outcome)
+
+        if mid_price is None:
+            return
+
+        # Get orders to cancel and recreate
+        to_cancel, to_recreate = tracker.process_tick(mid_price, time.time())
+
+        # Cancel far/old hanging orders
+        for order in to_cancel:
+            if self.config.dry_run:
+                logger.info(
+                    f"[DRY RUN] Would cancel hanging order {order.order_id}"
+                )
+                continue
+
+            try:
+                side = Side.BID if order.is_buy else Side.ASK
+                sdk_price = convert_price_for_order(order.price, side)
+                self._client.cancel_order(
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    price=sdk_price,
+                    wait=False,
+                )
+                tracker.mark_cancellation_pending(order.order_id)
+                self._in_flight_cancels.add(order.order_id)
+                self.stats.orders_cancelled += 1
+                logger.info(f"Cancelled hanging order {order.order_id}")
+            except Exception as e:
+                logger.error(f"Failed to cancel hanging order: {e}")
+
+        # Recreate renewed hanging orders
+        for order in to_recreate:
+            if self.config.dry_run:
+                logger.info(
+                    f"[DRY RUN] Would recreate hanging order at {order.price}¢"
+                )
+                continue
+
+            try:
+                if order.is_buy:
+                    tx_hash = self._client.place_buy_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        price=order.price,
+                        amount=order.amount,
+                        wait=True,
+                    )
+                else:
+                    tx_hash = self._client.place_sell_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        price=order.price,
+                        amount=order.amount,
+                        wait=True,
+                    )
+
+                self.stats.orders_placed += 1
+                logger.info(
+                    f"Recreated hanging order at {order.price}¢ (was {order.order_id})"
+                )
+            except Exception as e:
+                logger.error(f"Failed to recreate hanging order: {e}")
+
+    def _execute_order_override(
+        self,
+        context: MarketContext,
+        outcome: bool,
+        proposals: List[Tuple[str, int, int]],
+    ) -> None:
+        """
+        Execute orders from order_override configuration.
+
+        Args:
+            context: Market context
+            outcome: True for YES, False for NO
+            proposals: List of (side_str, price, amount) tuples
+        """
+        for side_str, price, amount in proposals:
+            side = Side.BID if side_str == "buy" else Side.ASK
+
+            if self.config.dry_run:
+                logger.info(
+                    f"[DRY RUN] Would place override {side_str} @{price}¢ x{amount}"
+                )
+                continue
+
+            try:
+                if side_str == "buy":
+                    tx_hash = self._client.place_buy_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        price=price,
+                        amount=amount,
+                        wait=True,
+                    )
+                else:
+                    tx_hash = self._client.place_sell_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        price=price,
+                        amount=amount,
+                        wait=True,
+                    )
+
+                self.stats.orders_placed += 1
+                logger.info(
+                    f"Placed override {side_str} @{price}¢ x{amount}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to place override order: {e}")
+
+    def _main_loop(self) -> None:
+        """Main trading loop."""
+        logger.info("Starting main loop")
+        logger.info(f"Execution mode: {self._execution_state}")
+
+        while not self._shutdown_requested:
+            cycle_start = time.time()
+
+            # Check execution state - should we trade right now?
+            if not self._execution_state.should_execute(cycle_start):
+                # Outside trading window - cancel active orders
+                logger.debug("Outside execution timeframe, skipping cycle")
+                self._cancel_all_active_orders()
+                self.stats.cycles += 1
+                time.sleep(self.config.order_book_poll_interval)
+                continue
+
+            # Check if we can create orders (respects should_wait_order_cancel_confirmation)
+            if not self._can_create_orders():
+                logger.debug(
+                    f"Waiting for {len(self._in_flight_cancels)} cancellation(s) to complete"
+                )
+                time.sleep(1.0)  # Brief wait before retry
+                continue
+
+            # Refresh inventory periodically
+            if (
+                time.time() - self._last_inventory_refresh
+                >= self.config.inventory_refresh_interval
+            ):
+                self._refresh_inventory()
+
+            # Process each market
+            for query_id, context in self._markets.items():
+                if self._shutdown_requested:
+                    break
+
+                try:
+                    self._process_market(context)
+                except Exception as e:
+                    logger.error(f"Error processing market {query_id}: {e}")
+                    self.stats.errors += 1
+
+            self.stats.cycles += 1
+
+            # Sleep until next poll interval
+            elapsed = time.time() - cycle_start
+            sleep_time = max(0, self.config.order_book_poll_interval - elapsed)
+            if sleep_time > 0 and not self._shutdown_requested:
+                time.sleep(sleep_time)
+
+    def _cancel_all_active_orders(self) -> None:
+        """Cancel all active orders (used when outside execution timeframe)."""
+        if self.config.dry_run:
+            return
+
+        for context in self._markets.values():
+            for outcome in [True, False]:
+                orders = context.get_orders(outcome)
+                for side, order in [(Side.BID, orders.bid), (Side.ASK, orders.ask)]:
+                    if order is not None:
+                        try:
+                            sdk_price = convert_price_for_order(order.price, side)
+                            self._client.cancel_order(
+                                query_id=context.query_id,
+                                outcome=outcome,
+                                price=sdk_price,
+                                wait=False,  # Don't wait
+                            )
+                            self._in_flight_cancels.add(
+                                f"{context.query_id}_{outcome}_{side.value}"
+                            )
+                            self.stats.orders_cancelled += 1
+
+                            # Untrack the order
+                            self._order_state.untrack_order(
+                                query_id=context.query_id,
+                                outcome=outcome,
+                                is_buy=(side == Side.BID),
+                                price=order.price,
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to cancel order: {e}")
+
+    def _shutdown(self) -> None:
+        """Graceful shutdown - optionally cancel all orders based on config."""
+        if self.config.cancel_open_orders_on_exit:
+            logger.info("Shutting down - cancelling all open orders...")
+
+            if self.config.dry_run:
+                logger.info("[DRY RUN] Would cancel all orders")
+            else:
+                for context in self._markets.values():
+                    self._cancel_market_orders(context)
+        else:
+            logger.info("Shutting down - leaving orders open (cancel_open_orders_on_exit=False)")
+
+        logger.info(
+            f"Shutdown complete. Stats: "
+            f"placed={self.stats.orders_placed} "
+            f"updated={self.stats.orders_updated} "
+            f"cancelled={self.stats.orders_cancelled} "
+            f"errors={self.stats.errors} "
+            f"cycles={self.stats.cycles}"
+        )
+
+    def run(self) -> None:
+        """Start the market maker bot."""
+        logger.info("Starting Avellaneda Market Maker")
+
+        try:
+            self._setup_signal_handlers()
+            self._init_client()
+            self._init_markets()
+
+            if not self._markets:
+                logger.error("No markets configured")
+                return
+
+            # Reconcile orders from previous session (recover bot's own orders)
+            self._reconcile_orders_on_startup()
+
+            # Initial inventory refresh
+            self._refresh_inventory()
+
+            # Run main loop
+            self._running = True
+            self._main_loop()
+
+        except Exception as e:
+            logger.error(f"Fatal error: {e}", exc_info=True)
+            self.stats.errors += 1
+
+        finally:
+            self._running = False
+            self._shutdown()

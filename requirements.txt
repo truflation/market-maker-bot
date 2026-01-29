@@ -1,0 +1,9 @@
+# TrufNetwork SDK
+trufnetwork-sdk-py @ git+https://github.com/trufnetwork/sdk-py.git
+
+# Configuration
+pyyaml>=6.0
+
+# Numerical computations
+numpy>=1.24.0
+scipy>=1.10.0

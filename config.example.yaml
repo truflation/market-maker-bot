@@ -1,0 +1,166 @@
+# Avellaneda Market Making Bot Configuration
+# Copy to config.yaml and customize
+
+# Network connection
+node_url: "http://localhost:8484"
+# private_key from TN_PRIVATE_KEY environment variable
+
+# =============================================================================
+# Pre-Approved Streams for Market Making
+# =============================================================================
+# Available streams (use stream_id in markets config below):
+#
+#   Key              | Stream ID                          | Name
+#   -----------------|------------------------------------|-----------------------
+#   us_inflation_yoy | st1e321de22ece39a258bc2588dd2871   | US Inflation YoY
+#   us_cpi_index     | st8f1e62d3a130572ec468dda082f889   | US CPI Index
+#   us_cpi_index_alt | st1d6d41423cd9746a81ea6063b1345e   | US CPI Index Alt
+#   eu_inflation_yoy | ste03c2844c591a10d8a524d14d23066   | EU Inflation YoY
+#   eu_cpi_index     | ste909219dce3f693c61a0f187758fb0   | EU CPI Index
+#   egg_price        | stf6584cf470744723c90130130cb7db   | Egg Price
+#
+# Default data provider: 0x4710a8d8f0d845da110086812a32de6d90d7ff5c (Truflation)
+
+# Markets to trade
+# Choose which streams/markets you want to market make
+markets:
+  # Example: Market making on US Inflation YoY
+  - query_id: 1
+    stream_id: "st1e321de22ece39a258bc2588dd2871"
+    data_provider: "0x4710a8d8f0d845da110086812a32de6d90d7ff5c"
+    name: "US Inflation YoY"
+    outcome_mode: "yes"  # Options: "yes", "no", "both"
+    order_amount: 100
+    enabled: true
+    # Market-specific overrides (optional)
+    # gamma: 0.15
+    # min_spread: 3.0
+
+  # Example: Market making on US CPI Index
+  # - query_id: 2
+  #   stream_id: "st8f1e62d3a130572ec468dda082f889"
+  #   data_provider: "0x4710a8d8f0d845da110086812a32de6d90d7ff5c"
+  #   name: "US CPI Index"
+  #   outcome_mode: "both"
+  #   order_amount: 50
+  #   enabled: true
+
+  # Example: Market making on EU Inflation YoY
+  # - query_id: 3
+  #   stream_id: "ste03c2844c591a10d8a524d14d23066"
+  #   data_provider: "0x4710a8d8f0d845da110086812a32de6d90d7ff5c"
+  #   name: "EU Inflation YoY"
+  #   outcome_mode: "yes"
+  #   order_amount: 100
+  #   enabled: true
+
+  # Example: Market making on Egg Price
+  # - query_id: 4
+  #   stream_id: "stf6584cf470744723c90130130cb7db"
+  #   data_provider: "0x4710a8d8f0d845da110086812a32de6d90d7ff5c"
+  #   name: "Egg Price"
+  #   outcome_mode: "both"
+  #   order_amount: 100
+  #   enabled: true
+
+# Avellaneda-Stoikov strategy parameters
+avellaneda:
+  # Risk factor (gamma / γ)
+  # Higher = wider spreads, more conservative
+  # Lower = tighter spreads, more aggressive
+  risk_factor: 1.0
+
+  # Order amount shape factor (eta / η)
+  # Range: 0.0 to 1.0
+  # With eta=0, buy and sell orders have the same size
+  # With eta>0, order sizes decrease exponentially for orders against inventory target
+  order_amount_shape_factor: 0.0
+
+  # Minimum spread as percentage of mid price
+  # 0 = no minimum, 2.0 = 2% of mid price
+  min_spread: 0.0
+
+  # Order refresh time in seconds
+  order_refresh_time: 10.0
+
+  # Maximum order age before forced refresh (seconds)
+  max_order_age: 1800.0
+
+  # Order refresh tolerance (%)
+  # Only refresh if price changed by more than this percentage
+  order_refresh_tolerance_pct: 0.0
+
+  # Delay after fill before placing new orders (seconds)
+  filled_order_delay: 60.0
+
+  # Inventory target as percentage of total value in shares
+  # 50 = aim for 50% shares, 50% USD (neutral)
+  inventory_target_base_pct: 50.0
+
+  # Add transaction costs to order prices
+  add_transaction_costs: false
+
+  # Volatility buffer size (number of ticks)
+  volatility_buffer_size: 200
+
+  # Trading intensity buffer size (number of ticks)
+  trading_intensity_buffer_size: 200
+
+  # Order optimization - jump to best bid+1 / best ask-1
+  order_optimization_enabled: true
+
+  # Multiple order levels
+  order_levels: 1              # Number of orders on each side (1 = single order)
+  level_distances: 0.0         # Distance between levels as % of optimal spread
+
+  # Hanging orders - track unfilled orders after opposite side fills
+  hanging_orders_enabled: false
+  hanging_orders_cancel_pct: 10.0  # Cancel hanging orders at this % from mid
+
+  # Wait for order cancellation confirmation before placing new orders
+  should_wait_order_cancel_confirmation: true
+
+  # === Execution Timeframe ===
+  # Controls when the bot is allowed to trade
+  # Options: "infinite", "from_date_to_date", "daily_between_times"
+  execution_timeframe_mode: "infinite"
+
+  # For from_date_to_date mode (ISO format: YYYY-MM-DDTHH:MM:SS)
+  # execution_start_datetime: "2024-01-01T09:00:00"
+  # execution_end_datetime: "2024-12-31T17:00:00"
+
+  # For daily_between_times mode (HH:MM:SS format)
+  # execution_start_time: "09:30:00"
+  # execution_end_time: "16:00:00"
+
+  # === Order Override ===
+  # Custom order specifications that override calculated prices
+  # Format: {"name": ["buy"|"sell", spread_pct, amount]}
+  # Example: Places a buy 1% below mid and a sell 1% above mid
+  # order_override:
+  #   order_1: ["buy", 1.0, 100]
+  #   order_2: ["sell", 1.0, 100]
+
+  # Binary options specific parameters
+  volatility_min_samples: 10   # Minimum samples before using calculated volatility
+  default_volatility: 5.0      # Default volatility in cents when insufficient data
+  min_volatility: 1.0          # Floor volatility in cents
+  max_spread: 20.0             # Maximum spread in cents
+
+  # Stream volatility (for Black-Scholes initial pricing)
+  stream_volatility_lookback_days: 14
+  stream_volatility_min: 0.01  # 1% annual minimum
+
+  # Time horizon for A-S formulas
+  # 1.0 for infinite timeframe (recommended for 24/7 markets)
+  time_horizon: 1.0
+
+# Polling intervals
+order_book_poll_interval: 2.0    # Seconds between order book polls
+inventory_refresh_interval: 30.0  # Seconds between inventory refresh
+
+# Operational settings
+dry_run: false  # Set to true to log but not execute
+debug: false    # Enable verbose logging
+cancel_open_orders_on_exit: true  # Cancel all open orders when bot shuts down
+order_state_file: "bot_order_state.json"  # File to persist order state for restart recovery
