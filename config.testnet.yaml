@@ -1,0 +1,87 @@
+# Avellaneda Market Making Bot - Testnet Configuration
+# Usage: python -m market_maker_bot.main --config config.testnet.yaml
+
+# Network connection (testnet)
+node_url: "https://gateway.testnet.truf.network"
+# private_key from TN_PRIVATE_KEY environment variable
+
+# Testnet data provider
+# Data provider: 0xe5252596672cd0208a881bdb67c9df429916ba92
+
+# Testnet markets (query IDs 48-72 created by market creation bot on 2026-02-11)
+markets:
+  - query_id: 48
+    stream_id: "st5cda3b42dc3db0e49af57d7bf14905"
+    data_provider: "0xe5252596672cd0208a881bdb67c9df429916ba92"
+    name: "Testnet Mid-Cap Price"
+    outcome_mode: "yes"
+    order_amount: 10
+    enabled: true
+
+  - query_id: 53
+    stream_id: "st361547d8b439502d3828d74ca679b5"
+    data_provider: "0xe5252596672cd0208a881bdb67c9df429916ba92"
+    name: "Testnet Low-Cap Price"
+    outcome_mode: "yes"
+    order_amount: 10
+    enabled: true
+
+  - query_id: 58
+    stream_id: "st26e6f725c82630d2c5bd542883453f"
+    data_provider: "0xe5252596672cd0208a881bdb67c9df429916ba92"
+    name: "Testnet Rate A"
+    outcome_mode: "yes"
+    order_amount: 10
+    enabled: true
+
+  - query_id: 63
+    stream_id: "stf826b74de25bcae10dcde294c25e87"
+    data_provider: "0xe5252596672cd0208a881bdb67c9df429916ba92"
+    name: "Testnet Rate B"
+    outcome_mode: "yes"
+    order_amount: 10
+    enabled: true
+
+  - query_id: 68
+    stream_id: "stde38e5fd701194ef8da203c8fb012b"
+    data_provider: "0xe5252596672cd0208a881bdb67c9df429916ba92"
+    name: "Testnet Mid-Range Price"
+    outcome_mode: "yes"
+    order_amount: 10
+    enabled: true
+
+# Avellaneda-Stoikov strategy parameters (conservative for testnet)
+avellaneda:
+  risk_factor: 1.0
+  order_amount_shape_factor: 0.0
+  min_spread: 0.0
+  order_refresh_time: 10.0
+  max_order_age: 1800.0
+  order_refresh_tolerance_pct: 0.0
+  filled_order_delay: 60.0
+  inventory_target_base_pct: 50.0
+  add_transaction_costs: false
+  volatility_buffer_size: 200
+  trading_intensity_buffer_size: 200
+  order_optimization_enabled: true
+  order_levels: 1
+  hanging_orders_enabled: false
+  should_wait_order_cancel_confirmation: true
+  execution_timeframe_mode: "infinite"
+  volatility_min_samples: 10
+  default_volatility: 5.0
+  min_volatility: 1.0
+  max_spread: 20.0
+  stream_volatility_lookback_days: 14
+  stream_volatility_min: 0.01
+  time_horizon: 1.0
+
+# Polling intervals
+order_book_poll_interval: 5.0
+inventory_refresh_interval: 30.0
+
+# Operational settings
+dry_run: false
+debug: false
+cancel_open_orders_on_exit: true
+order_state_file: "bot_order_state.json"

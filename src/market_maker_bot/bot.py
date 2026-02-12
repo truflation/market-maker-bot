@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from trufnetwork_sdk_py.client import TNClient
 
 from .config import BotConfig, MarketConfig, AvellanedaConfig
-from .models import OutcomeMode, Side, PricingResult
+from .models import OutcomeMode, Side, PricingResult, MarketState
 from .market import (
     MarketContext,
     OrderManager,
@@ -259,8 +259,8 @@ class AvellanedaMarketMaker:
 
         logger.info(f"Connecting to {self.config.node_url}")
         self._client = TNClient(
-            node_url=self.config.node_url,
-            private_key=self.config.private_key,
+            url=self.config.node_url,
+            token=self.config.private_key,
         )
 
     def _setup_signal_handlers(self) -> None:
@@ -409,6 +409,10 @@ class AvellanedaMarketMaker:
                     f"No stream records for market {market_config.query_id}"
                 )
                 return None
+
+            # Convert StreamRecord objects to dicts if needed (SDK returns Pydantic models)
+            if records and hasattr(records[0], "dict"):
+                records = [r.dict() if hasattr(r, "dict") else r for r in records]
 
             # Get current spot value
             spot = get_current_spot_value(records)
@@ -956,12 +960,20 @@ class AvellanedaMarketMaker:
                         wait=True,
                     )
                 else:
-                    tx_hash = self._client.change_ask(
+                    # Cancel old ask (on opposite outcome from split order) then re-place.
+                    # Split orders land on the NOT-outcome side at 100-price.
+                    cancel_outcome = not outcome
+                    cancel_price = 100 - current_order.price
+                    self._client.cancel_order(
                         query_id=context.query_id,
-                        outcome=outcome,
-                        old_price=old_sdk_price,
-                        new_price=new_sdk_price,
-                        new_amount=amount,
+                        outcome=cancel_outcome,
+                        price=cancel_price,
+                        wait=True,
+                    )
+                    tx_hash = self._client.place_split_limit_order(
+                        query_id=context.query_id,
+                        true_price=new_price,
+                        amount=amount,
                         wait=True,
                     )
 
@@ -997,10 +1009,11 @@ class AvellanedaMarketMaker:
                         wait=True,
                     )
                 else:
-                    tx_hash = self._client.place_sell_order(
+                    # Use split limit order for asks (place_sell_order requires owning shares).
+                    # This mints share pairs and lists the unwanted (NO) side at 100-price.
+                    tx_hash = self._client.place_split_limit_order(
                         query_id=context.query_id,
-                        outcome=outcome,
-                        price=new_price,
+                        true_price=new_price,
                         amount=amount,
                         wait=True,
                     )
@@ -1042,11 +1055,17 @@ class AvellanedaMarketMaker:
                     continue
 
                 try:
-                    sdk_price = convert_price_for_order(order.price, side)
+                    if side == Side.ASK:
+                        # Ask orders are on the opposite outcome (from split limit orders)
+                        cancel_outcome = not outcome
+                        cancel_price = 100 - order.price
+                    else:
+                        cancel_outcome = outcome
+                        cancel_price = convert_price_for_order(order.price, side)
                     self._client.cancel_order(
                         query_id=context.query_id,
-                        outcome=outcome,
-                        price=sdk_price,
+                        outcome=cancel_outcome,
+                        price=cancel_price,
                         wait=True,
                     )
                     self.stats.orders_cancelled += 1

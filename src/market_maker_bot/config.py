@@ -58,9 +58,49 @@ APPROVED_STREAMS: Dict[str, ApprovedStream] = {
 }
 
 
+TESTNET_APPROVED_STREAMS: Dict[str, ApprovedStream] = {
+    "testnet_btc_price": ApprovedStream(
+        stream_id="st9058219c3c3247faf2b0a738de7027",
+        name="Testnet BTC-like Price",
+        description="Testnet BTC-like Price Stream",
+        data_provider="0xe5252596672cd0208a881bdb67c9df429916ba92",
+    ),
+    "testnet_midcap_price": ApprovedStream(
+        stream_id="st5cda3b42dc3db0e49af57d7bf14905",
+        name="Testnet Mid-Cap Price",
+        description="Testnet Mid-Cap Price Stream",
+        data_provider="0xe5252596672cd0208a881bdb67c9df429916ba92",
+    ),
+    "testnet_lowcap_price": ApprovedStream(
+        stream_id="st361547d8b439502d3828d74ca679b5",
+        name="Testnet Low-Cap Price",
+        description="Testnet Low-Cap Price Stream",
+        data_provider="0xe5252596672cd0208a881bdb67c9df429916ba92",
+    ),
+    "testnet_rate_a": ApprovedStream(
+        stream_id="st26e6f725c82630d2c5bd542883453f",
+        name="Testnet Rate A",
+        description="Testnet Rate A Stream",
+        data_provider="0xe5252596672cd0208a881bdb67c9df429916ba92",
+    ),
+    "testnet_rate_b": ApprovedStream(
+        stream_id="stf826b74de25bcae10dcde294c25e87",
+        name="Testnet Rate B",
+        description="Testnet Rate B Stream",
+        data_provider="0xe5252596672cd0208a881bdb67c9df429916ba92",
+    ),
+    "testnet_midrange_price": ApprovedStream(
+        stream_id="stde38e5fd701194ef8da203c8fb012b",
+        name="Testnet Mid-Range Price",
+        description="Testnet Mid-Range Price Stream",
+        data_provider="0xe5252596672cd0208a881bdb67c9df429916ba92",
+    ),
+}
+
+
 def get_approved_stream(key: str) -> Optional[ApprovedStream]:
-    """Get an approved stream by its key."""
-    return APPROVED_STREAMS.get(key)
+    """Get an approved stream by its key (checks both mainnet and testnet)."""
+    return APPROVED_STREAMS.get(key) or TESTNET_APPROVED_STREAMS.get(key)
 
 
 def list_approved_streams() -> List[ApprovedStream]:
@@ -247,6 +287,8 @@ class BotConfig:
 
 def load_config_from_dict(data: dict) -> BotConfig:
     """Load configuration from a dictionary (e.g., from YAML/JSON)."""
+    import os
+
     avellaneda_data = data.get("avellaneda", {})
     avellaneda_config = AvellanedaConfig(**avellaneda_data)
 
@@ -256,9 +298,12 @@ def load_config_from_dict(data: dict) -> BotConfig:
         market_data["outcome_mode"] = OutcomeMode(outcome_mode_str)
         markets.append(MarketConfig(**market_data))
 
+    # Private key: YAML > TN_PRIVATE_KEY env var
+    private_key = data.get("private_key", "") or os.environ.get("TN_PRIVATE_KEY", "")
+
     return BotConfig(
         node_url=data.get("node_url", "http://localhost:8484"),
-        private_key=data.get("private_key", ""),
+        private_key=private_key,
         markets=markets,
         avellaneda=avellaneda_config,
         order_book_poll_interval=data.get("order_book_poll_interval", 2.0),
