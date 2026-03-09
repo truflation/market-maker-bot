@@ -123,6 +123,11 @@ class MarketConfig:
     gamma: Optional[float] = None
     min_spread: Optional[float] = None
 
+    # Threshold data from generated_markets (for Black-Scholes pricing)
+    lower_bound: Optional[float] = None
+    upper_bound: Optional[float] = None
+    settle_time: Optional[int] = None
+
     def __post_init__(self):
         if not self.name:
             self.name = f"Market-{self.query_id}"
@@ -250,7 +255,7 @@ class AvellanedaConfig:
 
     # Stream volatility parameters (for Black-Scholes initial pricing)
     stream_volatility_lookback_days: int = 14
-    stream_volatility_min: float = 0.01  # Minimum annual volatility (1%)
+    stream_volatility_min: float = 1.0  # Minimum annual volatility (100%) - wide quotes when no data
 
     # Maximum spread in cents (hard ceiling for binary options)
     max_spread: float = 20.0

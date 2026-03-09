@@ -333,22 +333,26 @@ class AvellanedaMarketMaker:
                 try:
                     # Get order book from SDK
                     order_book = self._client.get_order_book(query_id, outcome)
-                    state = build_market_state(order_book)
+                    state = build_market_state(
+                        query_id=query_id,
+                        outcome=outcome,
+                        order_book_entries=order_book,
+                    )
                     context.set_state(outcome, state)
 
                     # Get our tracked prices
                     for tracked in outcome_orders:
                         # Check if order is still on the book
                         is_on_book = False
-                        if tracked.is_buy and state.bids:
+                        if tracked.is_buy and state.bid_levels:
                             is_on_book = any(
                                 entry.price == tracked.price
-                                for entry in state.bids
+                                for entry in state.bid_levels
                             )
-                        elif not tracked.is_buy and state.asks:
+                        elif not tracked.is_buy and state.ask_levels:
                             is_on_book = any(
                                 entry.price == tracked.price
-                                for entry in state.asks
+                                for entry in state.ask_levels
                             )
 
                         if is_on_book:
@@ -398,10 +402,16 @@ class AvellanedaMarketMaker:
             Fair value in cents (1-99), or None if calculation fails
         """
         try:
-            # Fetch stream records
+            # Fetch stream records with explicit date range.
+            # 365 days ensures enough history for monthly streams;
+            # the vol calculator applies its own per-frequency lookback internally.
+            now_ts = int(time.time())
+            date_from = now_ts - 365 * 86400
             records = self._client.get_records(
                 stream_id=market_config.stream_id,
                 data_provider=market_config.data_provider,
+                date_from=date_from,
+                date_to=now_ts,
             )
 
             if not records:
@@ -429,26 +439,57 @@ class AvellanedaMarketMaker:
                 min_volatility=self.config.avellaneda.stream_volatility_min,
             )
 
-            # For now, assume strike = spot (at-the-money)
-            # In practice, this would come from market metadata
-            strike = spot
-            time_years = 0.25  # Default 3 months expiry
+            # Time to expiry from settle_time, or default 3 months
+            if market_config.settle_time:
+                seconds_left = max(market_config.settle_time - int(time.time()), 3600)
+                time_years = seconds_left / (365.25 * 86400)
+            else:
+                time_years = 0.25
 
-            # Price the binary option
-            bs_result = price_binary_option(
-                spot=spot,
-                strike=strike,
-                time_years=time_years,
-                volatility=vol_result.annual_volatility,
-            )
+            vol = vol_result.annual_volatility
+            has_lower = market_config.lower_bound is not None
+            has_upper = market_config.upper_bound is not None
 
-            # Convert to cents
-            price_cents = max(1, min(99, int(round(bs_result.fair_value * 100))))
+            if has_lower and has_upper:
+                # Range market: "between X and Y"
+                # P(X <= S < Y) = P(S > X) - P(S > Y)
+                p_above_lower = price_binary_option(
+                    spot, market_config.lower_bound, time_years, vol
+                ).fair_value
+                p_above_upper = price_binary_option(
+                    spot, market_config.upper_bound, time_years, vol
+                ).fair_value
+                fair_value = max(0.001, min(0.999, p_above_lower - p_above_upper))
+                strike_desc = f"range [{market_config.lower_bound:.1f}, {market_config.upper_bound:.1f}]"
+            elif has_upper:
+                # "Below X" market: P(S < X) = 1 - P(S > X)
+                bs_result = price_binary_option(
+                    spot, market_config.upper_bound, time_years, vol
+                )
+                fair_value = 1.0 - bs_result.fair_value
+                strike_desc = f"below {market_config.upper_bound:.1f}"
+            elif has_lower:
+                # "Above X" market: P(S >= X) = P(S > X)
+                bs_result = price_binary_option(
+                    spot, market_config.lower_bound, time_years, vol
+                )
+                fair_value = bs_result.fair_value
+                strike_desc = f"above {market_config.lower_bound:.1f}"
+            else:
+                # Fallback: at-the-money (no threshold data)
+                bs_result = price_binary_option(
+                    spot, spot, time_years, vol
+                )
+                fair_value = bs_result.fair_value
+                strike_desc = f"ATM {spot:.1f}"
+
+            price_cents = max(1, min(99, int(round(fair_value * 100))))
 
             logger.info(
                 f"Market {market_config.query_id}: Black-Scholes initial price "
-                f"spot={spot:.2f} vol={vol_result.annual_volatility:.2%} "
-                f"→ fair_value={bs_result.fair_value:.3f} → {price_cents}¢"
+                f"spot={spot:.2f} vol={vol:.2%} T={time_years:.4f}y "
+                f"strike={strike_desc} "
+                f"-> fair_value={fair_value:.3f} -> {price_cents}c"
             )
 
             return float(price_cents)
