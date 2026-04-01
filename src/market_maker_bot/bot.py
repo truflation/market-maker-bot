@@ -5,10 +5,12 @@ Coordinates all components: pricing, indicators, inventory, and order management
 """
 
 import math
+import os
 import time
 import logging
 import signal
 from datetime import datetime, time as dt_time
+from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any, Set, TYPE_CHECKING
 from dataclasses import dataclass
 
@@ -46,6 +48,18 @@ from .hanging_orders import HangingOrdersTracker, HangingOrder, CreatedPairOfOrd
 from .order_state import OrderStateManager, TrackedOrder
 
 logger = logging.getLogger(__name__)
+
+SETTLED_MARKET_ERRORS = (
+    "already settled",
+    "settled market",
+)
+
+
+class MarketSettledError(Exception):
+    """Raised when an operation targets a market that has already settled."""
+    def __init__(self, query_id: int):
+        self.query_id = query_id
+        super().__init__(f"Market {query_id} has settled")
 
 
 @dataclass
@@ -796,11 +810,12 @@ class AvellanedaMarketMaker:
             return [(base_bid, base_ask)]
 
         level_distances_pct = self.config.avellaneda.level_distances
-        level_step = (optimal_spread / 2) * (level_distances_pct / 100)
+        # Ensure at least 1 cent per level (prices are integers 1-99)
+        level_step = max(1, int(round((optimal_spread / 2) * (level_distances_pct / 100))))
 
         levels = []
         for i in range(order_levels):
-            level_offset = int(round(i * level_step))
+            level_offset = i * level_step
             bid = max(1, base_bid - level_offset)
             ask = min(99, base_ask + level_offset)
 
@@ -903,7 +918,7 @@ class AvellanedaMarketMaker:
 
             # Update bid
             buy_result = self._update_single_order(
-                context, outcome, Side.BID, level_bid, bid_amt, order_mgr
+                context, outcome, Side.BID, level_bid, bid_amt, order_mgr, level_idx
             )
             if buy_result and self.config.avellaneda.hanging_orders_enabled:
                 buy_order_info = HangingOrder(
@@ -918,7 +933,7 @@ class AvellanedaMarketMaker:
 
             # Update ask
             sell_result = self._update_single_order(
-                context, outcome, Side.ASK, level_ask, ask_amt, order_mgr
+                context, outcome, Side.ASK, level_ask, ask_amt, order_mgr, level_idx
             )
             if sell_result and self.config.avellaneda.hanging_orders_enabled:
                 sell_order_info = HangingOrder(
@@ -947,6 +962,7 @@ class AvellanedaMarketMaker:
         new_price: int,
         amount: int,
         order_mgr: OrderManager,
+        level_idx: int = 0,
     ) -> Optional[str]:
         """
         Update a single order (bid or ask).
@@ -961,21 +977,22 @@ class AvellanedaMarketMaker:
             new_price: New price in cents (1-99)
             amount: Order amount
             order_mgr: Order manager instance
+            level_idx: Order level index (0 = tightest spread)
 
         Returns:
             Order ID (tx_hash) if order was placed/updated, None otherwise
         """
         should_update, reason = order_mgr.should_update_order(
-            outcome, side, new_price
+            outcome, side, new_price, level_idx
         )
 
         if not should_update:
             logger.debug(
-                f"Market {context.query_id} {side.value}: no update needed ({reason})"
+                f"Market {context.query_id} {side.value} L{level_idx}: no update needed ({reason})"
             )
             return None
 
-        current_order = order_mgr.get_current_order(outcome, side)
+        current_order = order_mgr.get_current_order(outcome, side, level_idx)
 
         if self.config.dry_run:
             logger.info(
@@ -987,6 +1004,14 @@ class AvellanedaMarketMaker:
 
         try:
             if current_order is not None:
+                # Skip if price hasn't actually changed
+                if current_order.price == new_price:
+                    logger.debug(
+                        f"Market {context.query_id} {side.value} L{level_idx}: "
+                        f"price unchanged at {new_price}¢, skipping"
+                    )
+                    return None
+
                 # Use atomic update
                 old_sdk_price = convert_price_for_order(current_order.price, side)
                 new_sdk_price = convert_price_for_order(new_price, side)
@@ -1018,7 +1043,7 @@ class AvellanedaMarketMaker:
                         wait=True,
                     )
 
-                order_mgr.record_order(outcome, side, new_price, amount, tx_hash)
+                order_mgr.record_order(outcome, side, new_price, amount, tx_hash, level_idx)
                 self.stats.orders_updated += 1
 
                 # Update order state tracking (for restart recovery)
@@ -1033,7 +1058,7 @@ class AvellanedaMarketMaker:
                 )
 
                 logger.info(
-                    f"Market {context.query_id} {side.value}: updated "
+                    f"Market {context.query_id} {side.value} L{level_idx}: updated "
                     f"{current_order.price}→{new_price}¢ x{amount} ({reason})"
                 )
 
@@ -1059,7 +1084,7 @@ class AvellanedaMarketMaker:
                         wait=True,
                     )
 
-                order_mgr.record_order(outcome, side, new_price, amount, tx_hash)
+                order_mgr.record_order(outcome, side, new_price, amount, tx_hash, level_idx)
                 self.stats.orders_placed += 1
 
                 # Track order state (for restart recovery)
@@ -1073,13 +1098,16 @@ class AvellanedaMarketMaker:
                 )
 
                 logger.info(
-                    f"Market {context.query_id} {side.value}: placed "
+                    f"Market {context.query_id} {side.value} L{level_idx}: placed "
                     f"@{new_price}¢ x{amount}"
                 )
 
                 return tx_hash
 
         except Exception as e:
+            err_str = str(e).lower()
+            if any(msg in err_str for msg in SETTLED_MARKET_ERRORS):
+                raise MarketSettledError(context.query_id) from e
             logger.error(
                 f"Failed to update {side.value} for market {context.query_id}: {e}"
             )
@@ -1091,7 +1119,11 @@ class AvellanedaMarketMaker:
         for outcome in [True, False]:
             orders = context.get_orders(outcome)
 
-            for side, order in [(Side.BID, orders.bid), (Side.ASK, orders.ask)]:
+            all_orders = (
+                [(Side.BID, o) for o in orders.bids if o is not None] +
+                [(Side.ASK, o) for o in orders.asks if o is not None]
+            )
+            for side, order in all_orders:
                 if order is None:
                     continue
 
@@ -1320,6 +1352,7 @@ class AvellanedaMarketMaker:
                 logger.debug("Outside execution timeframe, skipping cycle")
                 self._cancel_all_active_orders()
                 self.stats.cycles += 1
+                self._write_heartbeat()
                 time.sleep(self.config.order_book_poll_interval)
                 continue
 
@@ -1339,23 +1372,41 @@ class AvellanedaMarketMaker:
                 self._refresh_inventory()
 
             # Process each market
+            settled_markets: list[int] = []
             for query_id, context in self._markets.items():
                 if self._shutdown_requested:
                     break
 
                 try:
                     self._process_market(context)
+                except MarketSettledError:
+                    logger.warning(f"Market {query_id} has settled, removing from active set")
+                    settled_markets.append(query_id)
                 except Exception as e:
                     logger.error(f"Error processing market {query_id}: {e}")
                     self.stats.errors += 1
 
+            for qid in settled_markets:
+                del self._markets[qid]
+
             self.stats.cycles += 1
+            self._write_heartbeat()
 
             # Sleep until next poll interval
             elapsed = time.time() - cycle_start
             sleep_time = max(0, self.config.order_book_poll_interval - elapsed)
             if sleep_time > 0 and not self._shutdown_requested:
                 time.sleep(sleep_time)
+
+    def _write_heartbeat(self) -> None:
+        """Write a heartbeat file so the orchestrator can detect if we're stuck."""
+        heartbeat_path = os.environ.get("MM_HEARTBEAT_FILE")
+        if not heartbeat_path:
+            return
+        try:
+            Path(heartbeat_path).write_text(str(time.time()))
+        except OSError:
+            pass
 
     def _cancel_all_active_orders(self) -> None:
         """Cancel all active orders (used when outside execution timeframe)."""
