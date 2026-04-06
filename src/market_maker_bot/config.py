@@ -288,6 +288,7 @@ class BotConfig:
     debug: bool = False  # Enable verbose logging
     cancel_open_orders_on_exit: bool = True  # Cancel all open orders when bot shuts down
     order_state_file: str = "bot_order_state.json"  # File to persist order state for restart recovery
+    pre_settlement_cutoff: float = 900.0  # Seconds before settle_time to pull all liquidity (default 15 min)
 
 
 def load_config_from_dict(data: dict) -> BotConfig:
@@ -317,4 +318,5 @@ def load_config_from_dict(data: dict) -> BotConfig:
         debug=data.get("debug", False),
         cancel_open_orders_on_exit=data.get("cancel_open_orders_on_exit", True),
         order_state_file=data.get("order_state_file", "bot_order_state.json"),
+        pre_settlement_cutoff=data.get("pre_settlement_cutoff", 900.0),
     )

@@ -134,6 +134,7 @@ class AvellanedaMarketMaker:
 
         # In-flight cancellations (for should_wait_order_cancel_confirmation)
         self._in_flight_cancels: Set[str] = set()
+        self._pre_settlement_pulled: Set[int] = set()
 
         # Order state persistence (for restart recovery)
         self._order_state = OrderStateManager(config.order_state_file)
@@ -359,8 +360,9 @@ class AvellanedaMarketMaker:
                         # Check if order is still on the book
                         is_on_book = False
                         if tracked.is_buy and state.bid_levels:
+                            # bid_levels have negative prices (SDK format), tracked.price is positive
                             is_on_book = any(
-                                entry.price == tracked.price
+                                abs(entry.price) == tracked.price
                                 for entry in state.bid_levels
                             )
                         elif not tracked.is_buy and state.ask_levels:
@@ -1026,19 +1028,40 @@ class AvellanedaMarketMaker:
                         wait=True,
                     )
                 else:
-                    # Cancel old ask (on opposite outcome from split order) then re-place.
-                    # Split orders land on the NOT-outcome side at 100-price.
-                    cancel_outcome = not outcome
-                    cancel_price = 100 - current_order.price
-                    self._client.cancel_order(
+                    # Cancel old asks on both sides, then re-mint and re-place.
+                    old_split_price = current_order.price if outcome else (100 - current_order.price)
+                    # Cancel NO-side ask
+                    try:
+                        self._client.cancel_order(
+                            query_id=context.query_id,
+                            outcome=False,
+                            price=100 - old_split_price,
+                            wait=True,
+                        )
+                    except Exception:
+                        pass  # May already be filled/cancelled
+                    # Cancel YES-side ask
+                    try:
+                        self._client.cancel_order(
+                            query_id=context.query_id,
+                            outcome=True,
+                            price=old_split_price,
+                            wait=True,
+                        )
+                    except Exception:
+                        pass  # May already be filled/cancelled
+                    # Mint new pairs and place asks on both sides
+                    split_price = new_price if outcome else (100 - new_price)
+                    self._client.place_split_limit_order(
                         query_id=context.query_id,
-                        outcome=cancel_outcome,
-                        price=cancel_price,
+                        true_price=split_price,
+                        amount=amount,
                         wait=True,
                     )
-                    tx_hash = self._client.place_split_limit_order(
+                    tx_hash = self._client.place_sell_order(
                         query_id=context.query_id,
-                        true_price=new_price,
+                        outcome=True,
+                        price=split_price,
                         amount=amount,
                         wait=True,
                     )
@@ -1075,11 +1098,21 @@ class AvellanedaMarketMaker:
                         wait=True,
                     )
                 else:
-                    # Use split limit order for asks (place_sell_order requires owning shares).
-                    # This mints share pairs and lists the unwanted (NO) side at 100-price.
-                    tx_hash = self._client.place_split_limit_order(
+                    # Mint share pairs and place asks on BOTH sides of the book.
+                    # place_split_limit_order mints pairs and sells NO at (100 - true_price).
+                    # We then also sell the YES shares we retained via place_sell_order.
+                    split_price = new_price if outcome else (100 - new_price)
+                    self._client.place_split_limit_order(
                         query_id=context.query_id,
-                        true_price=new_price,
+                        true_price=split_price,
+                        amount=amount,
+                        wait=True,
+                    )
+                    # Place YES sell order with the shares we just minted
+                    tx_hash = self._client.place_sell_order(
+                        query_id=context.query_id,
+                        outcome=True,
+                        price=split_price,
                         amount=amount,
                         wait=True,
                     )
@@ -1108,6 +1141,27 @@ class AvellanedaMarketMaker:
             err_str = str(e).lower()
             if any(msg in err_str for msg in SETTLED_MARKET_ERRORS):
                 raise MarketSettledError(context.query_id) from e
+
+            # Clear stale order state so next cycle places a fresh order
+            # instead of retrying a failed update forever.
+            if current_order is not None and (
+                "order not found" in err_str or "old order not found" in err_str
+            ):
+                order_mgr.clear_order(outcome, side)
+                self._order_state.untrack_order(
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    is_buy=(side == Side.BID),
+                    price=current_order.price,
+                )
+                logger.warning(
+                    f"Market {context.query_id} {side.value}: "
+                    f"order not found on-chain, cleared stale state "
+                    f"(was @{current_order.price}¢). Will re-place next cycle."
+                )
+                self.stats.errors += 1
+                return None
+
             logger.error(
                 f"Failed to update {side.value} for market {context.query_id}: {e}"
             )
@@ -1129,18 +1183,28 @@ class AvellanedaMarketMaker:
 
                 try:
                     if side == Side.ASK:
-                        # Ask orders are on the opposite outcome (from split limit orders)
-                        cancel_outcome = not outcome
-                        cancel_price = 100 - order.price
+                        # Ask orders exist on both sides (split mint + sell).
+                        # Cancel NO-side ask and YES-side ask.
+                        split_price = order.price if outcome else (100 - order.price)
+                        for cancel_out, cancel_p in [(False, 100 - split_price), (True, split_price)]:
+                            try:
+                                self._client.cancel_order(
+                                    query_id=context.query_id,
+                                    outcome=cancel_out,
+                                    price=cancel_p,
+                                    wait=True,
+                                )
+                            except Exception:
+                                pass  # May already be filled/cancelled
                     else:
                         cancel_outcome = outcome
                         cancel_price = convert_price_for_order(order.price, side)
-                    self._client.cancel_order(
-                        query_id=context.query_id,
-                        outcome=cancel_outcome,
-                        price=cancel_price,
-                        wait=True,
-                    )
+                        self._client.cancel_order(
+                            query_id=context.query_id,
+                            outcome=cancel_outcome,
+                            price=cancel_price,
+                            wait=True,
+                        )
                     self.stats.orders_cancelled += 1
 
                     # Untrack the order
@@ -1168,6 +1232,20 @@ class AvellanedaMarketMaker:
         Args:
             context: Market context to process
         """
+        # Pull liquidity before settlement to protect capital
+        if context.config.settle_time and self.config.pre_settlement_cutoff > 0:
+            seconds_left = context.config.settle_time - int(time.time())
+            if seconds_left <= self.config.pre_settlement_cutoff:
+                if context.query_id not in self._pre_settlement_pulled:
+                    logger.info(
+                        f"Market {context.query_id}: within pre-settlement cutoff "
+                        f"({seconds_left}s left, cutoff={self.config.pre_settlement_cutoff}s). "
+                        f"Pulling liquidity."
+                    )
+                    self._cancel_market_orders(context)
+                    self._pre_settlement_pulled.add(context.query_id)
+                return
+
         mode = context.config.outcome_mode
 
         # Determine which outcomes to trade
@@ -1194,7 +1272,8 @@ class AvellanedaMarketMaker:
                     if outcome:
                         context.initial_price_yes = initial_price
                     else:
-                        context.initial_price_no = initial_price
+                        # NO fair value is complement of YES
+                        context.initial_price_no = 100 - initial_price
 
             # Check for order_override
             mid_price = context.get_mid_price(outcome)
@@ -1419,11 +1498,17 @@ class AvellanedaMarketMaker:
                 for side, order in [(Side.BID, orders.bid), (Side.ASK, orders.ask)]:
                     if order is not None:
                         try:
-                            sdk_price = convert_price_for_order(order.price, side)
+                            if side == Side.ASK:
+                                # Split limit orders always land on the NO side
+                                cancel_outcome = False
+                                cancel_price = (100 - order.price) if outcome else order.price
+                            else:
+                                cancel_outcome = outcome
+                                cancel_price = convert_price_for_order(order.price, side)
                             self._client.cancel_order(
                                 query_id=context.query_id,
-                                outcome=outcome,
-                                price=sdk_price,
+                                outcome=cancel_outcome,
+                                price=cancel_price,
                                 wait=False,  # Don't wait
                             )
                             self._in_flight_cancels.add(
