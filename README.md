@@ -4,6 +4,30 @@ An open-source market making bot for [Truflation](https://truflation.com) predic
 
 Run it to provide two-sided liquidity on prediction markets and earn a share of the 2% settlement fees.
 
+## Background
+
+### What is TRUF.NETWORK?
+
+[TRUF.NETWORK](https://truf.network) is a decentralized oracle network built by [Truflation](https://truflation.com) for publishing and consuming real-world economic data (CPI, inflation, commodity prices, etc.). It powers prediction markets that let users trade on the future value of these data streams.
+
+- **Website**: https://truf.network
+- **Documentation**: https://docs.truf.network
+- **Token & Governance**: https://docs.truf.network/token-governance/tokenomics
+- **Data explorer**: https://trufscan.io
+- **GitHub**: https://github.com/trufnetwork
+
+### What are TT and TT2?
+
+**TT** and **TT2** are the testnet tokens used as collateral for prediction market orders on TRUF.NETWORK testnet. They have no monetary value and are only used for testing the protocol before mainnet. On mainnet, the corresponding collateral token is $TRUF.
+
+- **TT2** is the newer testnet collateral token (used by the current bot deployment)
+- **TT** is the legacy testnet token
+- To run this bot on mainnet, you'll need $TRUF tokens instead: https://docs.truf.network/token-governance/get-truf-token
+
+### Prediction Markets on TRUF.NETWORK
+
+Each market is a binary prediction on a data stream outcome (e.g., "Will US CPI YoY be between 1.3% and 1.5% on April 10?"). Markets have two sides: YES and NO. Share prices range from 1c to 99c, where `YES price + NO price = 100c`. Liquidity providers earn a portion of the 2% settlement fee based on how long their orders stayed within the rewards-eligible spread.
+
 ## What It Does
 
 - Continuously quotes bids and asks on both YES and NO outcomes for configured markets
