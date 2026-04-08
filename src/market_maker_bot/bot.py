@@ -1173,11 +1173,7 @@ class AvellanedaMarketMaker:
         for outcome in [True, False]:
             orders = context.get_orders(outcome)
 
-            all_orders = (
-                [(Side.BID, o) for o in orders.bids if o is not None] +
-                [(Side.ASK, o) for o in orders.asks if o is not None]
-            )
-            for side, order in all_orders:
+            for side, order in [(Side.BID, orders.bid), (Side.ASK, orders.ask)]:
                 if order is None:
                     continue
 
