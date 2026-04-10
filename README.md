@@ -66,7 +66,7 @@ Per-block snapshots track LP positions while the market is live. Rewards are cal
 
 - Python 3.12+
 - A TRUF.NETWORK private key (generate one with `--generate-key`)
-- TT2 tokens to collateralize orders
+- USDC (mainnet) or TT2 (testnet) tokens to collateralize orders
 
 ## Installation
 
