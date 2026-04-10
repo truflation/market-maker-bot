@@ -18,11 +18,12 @@ Run it to provide two-sided liquidity on prediction markets and earn a share of 
 
 ### What are TT and TT2?
 
-**TT** and **TT2** are the testnet tokens used as collateral for prediction market orders on TRUF.NETWORK testnet. They have no monetary value and are only used for testing the protocol before mainnet. On mainnet, the corresponding collateral token is $TRUF.
+**TT** and **TT2** are the testnet tokens used for prediction markets on TRUF.NETWORK testnet. They have no monetary value and are only used for testing the protocol before mainnet. On mainnet, the corresponding collateral token is USDC and the utility token is $TRUF.
 
-- **TT2** is the newer testnet collateral token (used by the current bot deployment)
-- **TT** is the legacy testnet token
-- To run this bot on mainnet, you'll need $TRUF tokens instead: https://docs.truf.network/token-governance/get-truf-token
+- **TT2** is the testnet collateral token (used by the current bot deployment)
+- **TT** is the testnet utility token. The utility token is only necessary for the creation of new order books. *Placing orders does not require TT.*
+- To run this bot on testnet, you'll need to [acquire the testnet tokens](https://github.com/trufnetwork/node/blob/main/docs/testnet-wallet-funding.md)
+- To run this bot on mainnet, you'll need both USDC and [$TRUF tokens instead](https://docs.truf.network/token-governance/get-truf-token)
 
 ### Prediction Markets on TRUF.NETWORK
 
