@@ -1418,6 +1418,11 @@ class AvellanedaMarketMaker:
         logger.info("Starting main loop")
         logger.info(f"Execution mode: {self._execution_state}")
 
+        # Write initial heartbeat so the orchestrator can detect first-cycle hangs.
+        # Without this, the heartbeat file doesn't exist until after the first complete
+        # cycle, and the health check skips detection when no file is present.
+        self._write_heartbeat()
+
         while not self._shutdown_requested:
             cycle_start = time.time()
 
