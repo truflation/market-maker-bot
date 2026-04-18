@@ -90,9 +90,55 @@ class BotOrder:
 
 @dataclass
 class ActiveOrders:
-    """Tracks active orders for a market outcome."""
-    bid: Optional[BotOrder] = None
-    ask: Optional[BotOrder] = None
+    """Tracks active orders for a market outcome, supporting multiple levels."""
+    bids: list = field(default_factory=lambda: [None])
+    asks: list = field(default_factory=lambda: [None])
+
+    @property
+    def bid(self) -> Optional[BotOrder]:
+        """Get L0 bid (backwards compat)."""
+        return self.bids[0] if self.bids else None
+
+    @bid.setter
+    def bid(self, value):
+        if not self.bids:
+            self.bids = [value]
+        else:
+            self.bids[0] = value
+
+    @property
+    def ask(self) -> Optional[BotOrder]:
+        """Get L0 ask (backwards compat)."""
+        return self.asks[0] if self.asks else None
+
+    @ask.setter
+    def ask(self, value):
+        if not self.asks:
+            self.asks = [value]
+        else:
+            self.asks[0] = value
+
+    def get_bid(self, level: int = 0) -> Optional[BotOrder]:
+        self._ensure_level(level)
+        return self.bids[level]
+
+    def get_ask(self, level: int = 0) -> Optional[BotOrder]:
+        self._ensure_level(level)
+        return self.asks[level]
+
+    def set_bid(self, level: int, order: Optional[BotOrder]):
+        self._ensure_level(level)
+        self.bids[level] = order
+
+    def set_ask(self, level: int, order: Optional[BotOrder]):
+        self._ensure_level(level)
+        self.asks[level] = order
+
+    def _ensure_level(self, level: int):
+        while len(self.bids) <= level:
+            self.bids.append(None)
+        while len(self.asks) <= level:
+            self.asks.append(None)
 
 
 @dataclass

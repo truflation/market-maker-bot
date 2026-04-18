@@ -218,6 +218,7 @@ class OrderManager:
         outcome: bool,
         side: Side,
         new_price: int,
+        level_idx: int = 0,
     ) -> tuple[bool, str]:
         """
         Determine if an order should be updated.
@@ -226,12 +227,12 @@ class OrderManager:
             outcome: True for YES, False for NO
             side: Order side (bid or ask)
             new_price: Proposed new price in cents
+            level_idx: Order level index (0 = tightest spread)
 
         Returns:
             Tuple of (should_update, reason)
         """
-        orders = self.context.get_orders(outcome)
-        current_order = orders.bid if side == Side.BID else orders.ask
+        current_order = self.get_current_order(outcome, side, level_idx)
 
         if current_order is None:
             return True, "no_existing_order"
@@ -257,6 +258,7 @@ class OrderManager:
         price: int,
         amount: int,
         tx_hash: str,
+        level_idx: int = 0,
     ) -> BotOrder:
         """
         Record a placed order.
@@ -267,6 +269,7 @@ class OrderManager:
             price: Order price in cents (1-99)
             amount: Order amount
             tx_hash: Transaction hash
+            level_idx: Order level index
 
         Returns:
             Created BotOrder
@@ -283,26 +286,26 @@ class OrderManager:
 
         orders = self.context.get_orders(outcome)
         if side == Side.BID:
-            orders.bid = order
+            orders.set_bid(level_idx, order)
         else:
-            orders.ask = order
+            orders.set_ask(level_idx, order)
 
         return order
 
-    def clear_order(self, outcome: bool, side: Side) -> None:
+    def clear_order(self, outcome: bool, side: Side, level_idx: int = 0) -> None:
         """Clear recorded order after cancellation."""
         orders = self.context.get_orders(outcome)
         if side == Side.BID:
-            orders.bid = None
+            orders.set_bid(level_idx, None)
         else:
-            orders.ask = None
+            orders.set_ask(level_idx, None)
 
     def get_current_order(
-        self, outcome: bool, side: Side
+        self, outcome: bool, side: Side, level_idx: int = 0
     ) -> Optional[BotOrder]:
-        """Get current order for outcome and side."""
+        """Get current order for outcome, side, and level."""
         orders = self.context.get_orders(outcome)
-        return orders.bid if side == Side.BID else orders.ask
+        return orders.get_bid(level_idx) if side == Side.BID else orders.get_ask(level_idx)
 
 
 def convert_price_for_order(price: int, side: Side) -> int:
