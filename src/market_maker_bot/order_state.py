@@ -26,12 +26,16 @@ class TrackedOrder:
     amount: int
     created_at: float  # Unix timestamp
     order_id: Optional[str] = None  # SDK order ID if available
+    level_idx: int = 0  # Order level index (0 = tightest spread)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> "TrackedOrder":
+        # Backwards compat: old state files may not have level_idx
+        if "level_idx" not in data:
+            data["level_idx"] = 0
         return cls(**data)
 
     @property
@@ -39,7 +43,7 @@ class TrackedOrder:
         """Unique key for this order position."""
         side = "buy" if self.is_buy else "sell"
         outcome_str = "yes" if self.outcome else "no"
-        return f"{self.query_id}:{outcome_str}:{side}:{self.price}"
+        return f"{self.query_id}:{outcome_str}:{side}:{self.price}:{self.level_idx}"
 
 
 class OrderStateManager:
@@ -110,6 +114,7 @@ class OrderStateManager:
         price: int,
         amount: int,
         order_id: Optional[str] = None,
+        level_idx: int = 0,
     ) -> TrackedOrder:
         """
         Track a new order placed by the bot.
@@ -121,6 +126,7 @@ class OrderStateManager:
             price: Order price in cents
             amount: Order amount
             order_id: Optional SDK order ID
+            level_idx: Order level index (0 = tightest spread)
 
         Returns:
             The tracked order
@@ -133,6 +139,7 @@ class OrderStateManager:
             amount=amount,
             created_at=time.time(),
             order_id=order_id,
+            level_idx=level_idx,
         )
 
         self._orders[order.key] = order
@@ -150,6 +157,7 @@ class OrderStateManager:
         new_price: int,
         amount: int,
         order_id: Optional[str] = None,
+        level_idx: int = 0,
     ) -> TrackedOrder:
         """
         Update a tracked order (price change).
@@ -162,17 +170,18 @@ class OrderStateManager:
             new_price: New price
             amount: Order amount
             order_id: Optional SDK order ID
+            level_idx: Order level index (0 = tightest spread)
 
         Returns:
             The updated tracked order
         """
         # Remove old order
-        old_key = self._make_key(query_id, outcome, is_buy, old_price)
+        old_key = self._make_key(query_id, outcome, is_buy, old_price, level_idx)
         if old_key in self._orders:
             del self._orders[old_key]
 
         # Add new order
-        return self.track_order(query_id, outcome, is_buy, new_price, amount, order_id)
+        return self.track_order(query_id, outcome, is_buy, new_price, amount, order_id, level_idx)
 
     def untrack_order(
         self,
@@ -180,6 +189,7 @@ class OrderStateManager:
         outcome: bool,
         is_buy: bool,
         price: int,
+        level_idx: int = 0,
     ) -> bool:
         """
         Remove an order from tracking (cancelled or filled).
@@ -189,11 +199,12 @@ class OrderStateManager:
             outcome: True for YES, False for NO
             is_buy: True for buy order, False for sell order
             price: Order price
+            level_idx: Order level index (0 = tightest spread)
 
         Returns:
             True if order was found and removed
         """
-        key = self._make_key(query_id, outcome, is_buy, price)
+        key = self._make_key(query_id, outcome, is_buy, price, level_idx)
         if key in self._orders:
             del self._orders[key]
             self._save_state()
@@ -207,6 +218,7 @@ class OrderStateManager:
         outcome: bool,
         is_buy: bool,
         price: int,
+        level_idx: int = 0,
     ) -> bool:
         """
         Check if an order was placed by the bot.
@@ -216,11 +228,12 @@ class OrderStateManager:
             outcome: True for YES, False for NO
             is_buy: True for buy order, False for sell order
             price: Order price
+            level_idx: Order level index (0 = tightest spread)
 
         Returns:
             True if this order is tracked by the bot
         """
-        key = self._make_key(query_id, outcome, is_buy, price)
+        key = self._make_key(query_id, outcome, is_buy, price, level_idx)
         return key in self._orders
 
     def get_tracked_order(
@@ -229,9 +242,10 @@ class OrderStateManager:
         outcome: bool,
         is_buy: bool,
         price: int,
+        level_idx: int = 0,
     ) -> Optional[TrackedOrder]:
         """Get a tracked order if it exists."""
-        key = self._make_key(query_id, outcome, is_buy, price)
+        key = self._make_key(query_id, outcome, is_buy, price, level_idx)
         return self._orders.get(key)
 
     def get_market_orders(
@@ -332,12 +346,12 @@ class OrderStateManager:
                 # Order is no longer on the book - was filled or cancelled
                 result["stale"].append(order)
                 # Remove from tracking
-                self.untrack_order(query_id, outcome, order.is_buy, order.price)
+                self.untrack_order(query_id, outcome, order.is_buy, order.price, order.level_idx)
 
         return result
 
-    def _make_key(self, query_id: int, outcome: bool, is_buy: bool, price: int) -> str:
+    def _make_key(self, query_id: int, outcome: bool, is_buy: bool, price: int, level_idx: int = 0) -> str:
         """Create a unique key for an order."""
         side = "buy" if is_buy else "sell"
         outcome_str = "yes" if outcome else "no"
-        return f"{query_id}:{outcome_str}:{side}:{price}"
+        return f"{query_id}:{outcome_str}:{side}:{price}:{level_idx}"

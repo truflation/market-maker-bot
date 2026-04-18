@@ -4,6 +4,7 @@ Main bot orchestrator for the Avellaneda Market Making Bot.
 Coordinates all components: pricing, indicators, inventory, and order management.
 """
 
+import json
 import math
 import os
 import time
@@ -139,6 +140,13 @@ class AvellanedaMarketMaker:
         # Order state persistence (for restart recovery)
         self._order_state = OrderStateManager(config.order_state_file)
 
+        # Derive pre_settlement_pulled persistence path from order_state_file
+        state_path = Path(config.order_state_file)
+        self._pre_settlement_file = str(
+            state_path.parent / "pre_settlement_pulled.json"
+        )
+        self._load_pre_settlement_pulled()
+
     def _create_execution_state(self) -> ExecutionState:
         """
         Create execution state from configuration.
@@ -176,6 +184,28 @@ class AvellanedaMarketMaker:
                 )
 
         return create_execution_state(config)
+
+    def _load_pre_settlement_pulled(self) -> None:
+        """Load persisted pre_settlement_pulled set from disk."""
+        try:
+            path = Path(self._pre_settlement_file)
+            if path.exists():
+                data = json.loads(path.read_text())
+                self._pre_settlement_pulled = set(data)
+                logger.info(
+                    f"Loaded {len(self._pre_settlement_pulled)} pre-settlement pulled markets from {self._pre_settlement_file}"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load pre_settlement_pulled: {e}")
+
+    def _save_pre_settlement_pulled(self) -> None:
+        """Persist pre_settlement_pulled set to disk."""
+        try:
+            Path(self._pre_settlement_file).write_text(
+                json.dumps(sorted(self._pre_settlement_pulled))
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save pre_settlement_pulled: {e}")
 
     def _get_hanging_tracker(
         self, query_id: int, outcome: bool
@@ -380,18 +410,20 @@ class AvellanedaMarketMaker:
                                 max_order_age=self.config.avellaneda.max_order_age,
                             )
                             order_mgr.record_order(
-                                outcome, side, tracked.price, tracked.amount, tracked.order_id
+                                outcome, side, tracked.price, tracked.amount, tracked.order_id,
+                                tracked.level_idx,
                             )
                             recovered += 1
                             logger.debug(
                                 f"Recovered order: market {query_id} "
                                 f"{'YES' if outcome else 'NO'} "
-                                f"{'buy' if tracked.is_buy else 'sell'} @{tracked.price}¢"
+                                f"{'buy' if tracked.is_buy else 'sell'} @{tracked.price}¢ L{tracked.level_idx}"
                             )
                         else:
                             # Order is no longer on the book - was filled or cancelled externally
                             self._order_state.untrack_order(
-                                query_id, outcome, tracked.is_buy, tracked.price
+                                query_id, outcome, tracked.is_buy, tracked.price,
+                                tracked.level_idx,
                             )
                             stale += 1
                             logger.debug(
@@ -639,6 +671,12 @@ class AvellanedaMarketMaker:
         min_spread_pct = context.config.min_spread or self.config.avellaneda.min_spread
         min_spread_cents = mid_price * (min_spread_pct / 100.0) if min_spread_pct > 0 else 0.0
 
+        # Derive Avellaneda time horizon from settle_time when available
+        time_horizon_override = None
+        if context.config.settle_time:
+            seconds_left = max(context.config.settle_time - int(time.time()), 3600)
+            time_horizon_override = seconds_left / (365.25 * 86400)
+
         # Calculate prices
         result = self._pricing.calculate_from_config(
             mid_price=mid_price,
@@ -647,6 +685,7 @@ class AvellanedaMarketMaker:
             kappa=kappa,
             gamma_override=gamma,
             min_spread_override=min_spread_cents,
+            time_horizon_override=time_horizon_override,
         )
 
         logger.debug(
@@ -814,10 +853,15 @@ class AvellanedaMarketMaker:
         level_distances_pct = self.config.avellaneda.level_distances
         # Ensure at least 1 cent per level (prices are integers 1-99)
         level_step = max(1, int(round((optimal_spread / 2) * (level_distances_pct / 100))))
+        gamma_mult = self.config.avellaneda.level_gamma_multiplier
 
         levels = []
         for i in range(order_levels):
-            level_offset = i * level_step
+            if i == 0:
+                level_offset = 0
+            else:
+                # Each level gets progressively wider spread via gamma scaling
+                level_offset = int(round(level_step * i * (gamma_mult ** i)))
             bid = max(1, base_bid - level_offset)
             ask = min(99, base_ask + level_offset)
 
@@ -909,10 +953,9 @@ class AvellanedaMarketMaker:
 
         # Execute orders for each level
         for level_idx, (level_bid, level_ask) in enumerate(order_levels):
-            # For now, only first level uses the calculated amounts
-            # Additional levels use base amount (could be enhanced)
-            bid_amt = bid_amount if level_idx == 0 else base_amount
-            ask_amt = ask_amount if level_idx == 0 else base_amount
+            # All levels get the eta-adjusted amounts
+            bid_amt = bid_amount
+            ask_amt = ask_amount
 
             # Track order pair for hanging orders (first level only)
             buy_order_info = None
@@ -1058,13 +1101,30 @@ class AvellanedaMarketMaker:
                         amount=amount,
                         wait=True,
                     )
-                    tx_hash = self._client.place_sell_order(
-                        query_id=context.query_id,
-                        outcome=True,
-                        price=split_price,
-                        amount=amount,
-                        wait=True,
-                    )
+                    try:
+                        tx_hash = self._client.place_sell_order(
+                            query_id=context.query_id,
+                            outcome=True,
+                            price=split_price,
+                            amount=amount,
+                            wait=True,
+                        )
+                    except Exception as sell_err:
+                        # Split succeeded but sell failed - try to cancel the
+                        # orphaned NO-side order placed by the split to recover.
+                        logger.error(f"place_sell_order failed after split mint: {sell_err}")
+                        try:
+                            cancel_price = 100 - split_price
+                            self._client.cancel_order(
+                                query_id=context.query_id,
+                                outcome=False,
+                                price=cancel_price,
+                                wait=True,
+                            )
+                            logger.info("Cancelled orphaned split order after sell failure")
+                        except Exception:
+                            logger.error("Failed to cancel orphaned split order")
+                        raise sell_err
 
                 order_mgr.record_order(outcome, side, new_price, amount, tx_hash, level_idx)
                 self.stats.orders_updated += 1
@@ -1078,6 +1138,7 @@ class AvellanedaMarketMaker:
                     new_price=new_price,
                     amount=amount,
                     order_id=tx_hash,
+                    level_idx=level_idx,
                 )
 
                 logger.info(
@@ -1109,13 +1170,30 @@ class AvellanedaMarketMaker:
                         wait=True,
                     )
                     # Place YES sell order with the shares we just minted
-                    tx_hash = self._client.place_sell_order(
-                        query_id=context.query_id,
-                        outcome=True,
-                        price=split_price,
-                        amount=amount,
-                        wait=True,
-                    )
+                    try:
+                        tx_hash = self._client.place_sell_order(
+                            query_id=context.query_id,
+                            outcome=True,
+                            price=split_price,
+                            amount=amount,
+                            wait=True,
+                        )
+                    except Exception as sell_err:
+                        # Split succeeded but sell failed - try to cancel the
+                        # orphaned NO-side order placed by the split to recover.
+                        logger.error(f"place_sell_order failed after split mint: {sell_err}")
+                        try:
+                            cancel_price = 100 - split_price
+                            self._client.cancel_order(
+                                query_id=context.query_id,
+                                outcome=False,
+                                price=cancel_price,
+                                wait=True,
+                            )
+                            logger.info("Cancelled orphaned split order after sell failure")
+                        except Exception:
+                            logger.error("Failed to cancel orphaned split order")
+                        raise sell_err
 
                 order_mgr.record_order(outcome, side, new_price, amount, tx_hash, level_idx)
                 self.stats.orders_placed += 1
@@ -1128,6 +1206,7 @@ class AvellanedaMarketMaker:
                     price=new_price,
                     amount=amount,
                     order_id=tx_hash,
+                    level_idx=level_idx,
                 )
 
                 logger.info(
@@ -1153,6 +1232,7 @@ class AvellanedaMarketMaker:
                     outcome=outcome,
                     is_buy=(side == Side.BID),
                     price=current_order.price,
+                    level_idx=level_idx,
                 )
                 logger.warning(
                     f"Market {context.query_id} {side.value}: "
@@ -1174,10 +1254,10 @@ class AvellanedaMarketMaker:
             orders = context.get_orders(outcome)
 
             all_orders = (
-                [(Side.BID, o) for o in orders.bids if o is not None] +
-                [(Side.ASK, o) for o in orders.asks if o is not None]
+                [(Side.BID, i, o) for i, o in enumerate(orders.bids) if o is not None] +
+                [(Side.ASK, i, o) for i, o in enumerate(orders.asks) if o is not None]
             )
-            for side, order in all_orders:
+            for side, lvl_idx, order in all_orders:
                 if order is None:
                     continue
 
@@ -1213,6 +1293,7 @@ class AvellanedaMarketMaker:
                         outcome=outcome,
                         is_buy=(side == Side.BID),
                         price=order.price,
+                        level_idx=lvl_idx,
                     )
 
                     logger.info(
@@ -1244,6 +1325,7 @@ class AvellanedaMarketMaker:
                     )
                     self._cancel_market_orders(context)
                     self._pre_settlement_pulled.add(context.query_id)
+                    self._save_pre_settlement_pulled()
                 return
 
         mode = context.config.outcome_mode
@@ -1565,6 +1647,10 @@ class AvellanedaMarketMaker:
             if not self._markets:
                 logger.error("No markets configured")
                 return
+
+            # Write heartbeat before reconciliation so the orchestrator doesn't
+            # kill us during the potentially long reconciliation phase.
+            self._write_heartbeat()
 
             # Reconcile orders from previous session (recover bot's own orders)
             self._reconcile_orders_on_startup()

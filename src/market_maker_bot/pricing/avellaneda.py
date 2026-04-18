@@ -214,6 +214,7 @@ class AvellanedaPricing:
         kappa: Optional[float] = None,
         gamma_override: Optional[float] = None,
         min_spread_override: Optional[float] = None,
+        time_horizon_override: Optional[float] = None,
     ) -> PricingResult:
         """
         Calculate prices using stored configuration.
@@ -225,6 +226,7 @@ class AvellanedaPricing:
             kappa: Optional kappa override (uses config default if None)
             gamma_override: Optional gamma override
             min_spread_override: Optional min spread override
+            time_horizon_override: Optional time horizon override (e.g., from settle_time)
 
         Returns:
             PricingResult
@@ -235,7 +237,7 @@ class AvellanedaPricing:
             volatility=max(volatility, self.config.min_volatility),
             kappa=kappa if kappa is not None else 1.0,  # Default kappa if not provided
             gamma=gamma_override if gamma_override is not None else self.config.risk_factor,
-            time_horizon=self.config.time_horizon,
+            time_horizon=time_horizon_override if time_horizon_override is not None else self.config.time_horizon,
             min_spread=(
                 min_spread_override
                 if min_spread_override is not None

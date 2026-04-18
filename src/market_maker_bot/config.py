@@ -210,6 +210,11 @@ class AvellanedaConfig:
     # Example: 20.0 means each level is 20% of optimal spread apart
     level_distances: float = 0.0
 
+    # Gamma multiplier per level for progressive spread widening
+    # Each deeper level widens offset by gamma_mult^level_idx
+    # 1.0 = linear spacing, 1.3 = ~30% wider per level
+    level_gamma_multiplier: float = 1.3
+
     # Hanging orders - track orders that remain after opposite side fills
     # When enabled, unfilled orders on the opposite side are tracked and managed
     hanging_orders_enabled: bool = False
