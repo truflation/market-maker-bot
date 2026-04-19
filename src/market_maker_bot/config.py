@@ -215,6 +215,11 @@ class AvellanedaConfig:
     # 1.0 = linear spacing, 1.3 = ~30% wider per level
     level_gamma_multiplier: float = 1.3
 
+    # Order size increase per level as percentage
+    # Each deeper level increases order size by this percentage
+    # 5.0 = 5% more per level (L0=base, L1=base*1.05, L2=base*1.1025, ...)
+    level_amount_increase_pct: float = 0.0
+
     # Hanging orders - track orders that remain after opposite side fills
     # When enabled, unfilled orders on the opposite side are tracked and managed
     hanging_orders_enabled: bool = False

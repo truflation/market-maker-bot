@@ -952,10 +952,12 @@ class AvellanedaMarketMaker:
         )
 
         # Execute orders for each level
+        level_inc = self.config.avellaneda.level_amount_increase_pct / 100.0
         for level_idx, (level_bid, level_ask) in enumerate(order_levels):
-            # All levels get the eta-adjusted amounts
-            bid_amt = bid_amount
-            ask_amt = ask_amount
+            # All levels get eta-adjusted amounts, scaled by level increase
+            level_mult = (1.0 + level_inc) ** level_idx if level_inc > 0 else 1.0
+            bid_amt = max(1, int(round(bid_amount * level_mult)))
+            ask_amt = max(1, int(round(ask_amount * level_mult)))
 
             # Track order pair for hanging orders (first level only)
             buy_order_info = None
