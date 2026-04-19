@@ -152,7 +152,7 @@ class AvellanedaConfig:
     # With eta=0, buy and sell orders have the same size regardless of inventory
     # With eta>0, order sizes decrease exponentially for orders against inventory target
     # Formula: size * exp(-eta * q) where q is inventory deviation
-    order_amount_shape_factor: float = 0.0
+    order_amount_shape_factor: float = 0.5
 
     # Minimum spread as percentage of mid price
     # For binary options: 0 means no minimum, 2.0 means 2% of mid price
@@ -173,7 +173,7 @@ class AvellanedaConfig:
     order_refresh_tolerance_pct: float = 0.0
 
     # Delay in seconds after a fill before placing new orders
-    filled_order_delay: float = 60.0
+    filled_order_delay: float = 10.0
 
     # Inventory target as percentage of total value in base asset (shares)
     # 50 = aim for 50% in shares, 50% in USD
@@ -258,14 +258,17 @@ class AvellanedaConfig:
     volatility_min_samples: int = 10
 
     # Default volatility in cents when insufficient samples
-    default_volatility: float = 5.0
+    default_volatility: float = 3.0
 
     # Floor volatility in cents (never go below this)
-    min_volatility: float = 1.0
+    min_volatility: float = 0.30
 
     # Stream volatility parameters (for Black-Scholes initial pricing)
     stream_volatility_lookback_days: int = 14
-    stream_volatility_min: float = 1.0  # Minimum annual volatility (100%) - wide quotes when no data
+    stream_volatility_min: float = 0.30  # Minimum annual volatility (30%) - matches stream_volatility.py floor
+
+    # Maximum position per outcome per market (in shares)
+    max_position_per_outcome: int = 50000
 
     # Maximum spread in cents (hard ceiling for binary options)
     max_spread: float = 20.0

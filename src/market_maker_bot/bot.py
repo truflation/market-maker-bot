@@ -73,6 +73,16 @@ class BotStats:
     cycles: int = 0
 
 
+@dataclass
+class TradingStats:
+    """Cumulative P&L tracking."""
+    total_bought_value: float = 0.0  # Total USD spent buying shares
+    total_sold_value: float = 0.0    # Total USD received selling shares
+    total_shares_bought: int = 0
+    total_shares_sold: int = 0
+    fills_detected: int = 0
+
+
 class AvellanedaMarketMaker:
     """
     Avellaneda-Stoikov market making bot for TrufNetwork prediction markets.
@@ -123,6 +133,7 @@ class AvellanedaMarketMaker:
 
         # Statistics
         self.stats = BotStats()
+        self._trading_stats = TradingStats()
 
         # Timing
         self._last_inventory_refresh = 0.0
@@ -856,6 +867,8 @@ class AvellanedaMarketMaker:
         gamma_mult = self.config.avellaneda.level_gamma_multiplier
 
         levels = []
+        seen_bids: set[int] = set()
+        seen_asks: set[int] = set()
         for i in range(order_levels):
             if i == 0:
                 level_offset = 0
@@ -866,6 +879,14 @@ class AvellanedaMarketMaker:
             ask = min(99, base_ask + level_offset)
 
             if bid < ask:  # Only add valid levels
+                # Skip levels where bid or ask duplicates a previous level
+                if bid in seen_bids or ask in seen_asks:
+                    logger.debug(
+                        f"Skipping duplicate order level {i}: bid={bid} ask={ask}"
+                    )
+                    continue
+                seen_bids.add(bid)
+                seen_asks.add(ask)
                 levels.append((bid, ask))
 
         return levels if levels else [(base_bid, base_ask)]
@@ -953,6 +974,10 @@ class AvellanedaMarketMaker:
 
         # Execute orders for each level
         for level_idx, (level_bid, level_ask) in enumerate(order_levels):
+            # Write heartbeat during long placement cycles to prevent orchestrator kills
+            if level_idx > 0 and level_idx % 5 == 0:
+                self._write_heartbeat()
+
             # All levels get the same eta-adjusted amount (A-S model: flat sizing,
             # inventory rebalancing handled by eta, risk by spread widening per level)
             bid_amt = bid_amount
@@ -993,7 +1018,7 @@ class AvellanedaMarketMaker:
                 )
 
             # Register pair for hanging order tracking
-            if self.config.avellaneda.hanging_orders_enabled and level_idx == 0:
+            if self.config.avellaneda.hanging_orders_enabled:
                 if buy_order_info or sell_order_info:
                     tracker = self._get_hanging_tracker(context.query_id, outcome)
                     tracker.add_order_pair(buy_order_info, sell_order_info)
@@ -1037,6 +1062,18 @@ class AvellanedaMarketMaker:
                 f"Market {context.query_id} {side.value} L{level_idx}: no update needed ({reason})"
             )
             return None
+
+        # Position limit enforcement: skip bids when at max inventory
+        if side == Side.BID:
+            inv = self._inventory.get_market_inventory(context.query_id)
+            current_shares = inv.yes_shares if outcome else inv.no_shares
+            max_pos = self.config.avellaneda.max_position_per_outcome
+            if max_pos > 0 and current_shares >= max_pos:
+                logger.warning(
+                    f"Market {context.query_id}: position limit reached "
+                    f"({current_shares}/{max_pos}), skipping bid"
+                )
+                return None
 
         current_order = order_mgr.get_current_order(outcome, side, level_idx)
 
@@ -1130,6 +1167,14 @@ class AvellanedaMarketMaker:
                 order_mgr.record_order(outcome, side, new_price, amount, tx_hash, level_idx)
                 self.stats.orders_updated += 1
 
+                # Track P&L
+                if side == Side.BID:
+                    self._trading_stats.total_bought_value += new_price * amount / 100.0
+                    self._trading_stats.total_shares_bought += amount
+                else:
+                    self._trading_stats.total_sold_value += new_price * amount / 100.0
+                    self._trading_stats.total_shares_sold += amount
+
                 # Update order state tracking (for restart recovery)
                 self._order_state.update_order(
                     query_id=context.query_id,
@@ -1198,6 +1243,14 @@ class AvellanedaMarketMaker:
 
                 order_mgr.record_order(outcome, side, new_price, amount, tx_hash, level_idx)
                 self.stats.orders_placed += 1
+
+                # Track P&L
+                if side == Side.BID:
+                    self._trading_stats.total_bought_value += new_price * amount / 100.0
+                    self._trading_stats.total_shares_bought += amount
+                else:
+                    self._trading_stats.total_sold_value += new_price * amount / 100.0
+                    self._trading_stats.total_shares_sold += amount
 
                 # Track order state (for restart recovery)
                 self._order_state.track_order(
@@ -1314,6 +1367,18 @@ class AvellanedaMarketMaker:
         Args:
             context: Market context to process
         """
+        # Liquidation mode: widen spreads and reduce inventory when T < 30 min
+        liquidation_mode = False
+        liquidation_skew_threshold = 0.3
+        if context.config.settle_time:
+            seconds_left_liq = context.config.settle_time - int(time.time())
+            if seconds_left_liq < 1800:
+                liquidation_mode = True
+                logger.info(
+                    f"Market {context.query_id}: liquidation mode, "
+                    f"{seconds_left_liq}s to settlement"
+                )
+
         # Pull liquidity before settlement to protect capital
         if context.config.settle_time and self.config.pre_settlement_cutoff > 0:
             seconds_left = context.config.settle_time - int(time.time())
@@ -1367,9 +1432,53 @@ class AvellanedaMarketMaker:
                     continue
 
             # Calculate prices using Avellaneda-Stoikov
+            # In liquidation mode, temporarily boost gamma by 5x for wider spreads
+            original_gamma = context.config.gamma
+            if liquidation_mode:
+                base_gamma = context.config.gamma or self.config.avellaneda.risk_factor
+                context.config.gamma = base_gamma * 5.0
+
             pricing = self._calculate_prices(context, outcome)
+
+            # Restore original gamma
+            if liquidation_mode:
+                context.config.gamma = original_gamma
+
             if pricing is None:
                 continue
+
+            # In liquidation mode with high inventory skew, only quote the
+            # side that reduces inventory (no new accumulation)
+            if liquidation_mode and abs(pricing.inventory_skew) > liquidation_skew_threshold:
+                q = pricing.inventory_skew
+                # q > 0 means long inventory -> only place asks (sell to reduce)
+                # q < 0 means short inventory -> only place bids (buy to reduce)
+                if q > 0:
+                    # Zero out bid so only ask is placed
+                    pricing = PricingResult(
+                        reservation_price=pricing.reservation_price,
+                        optimal_spread=pricing.optimal_spread,
+                        bid_price=0.0, ask_price=pricing.ask_price,
+                        mid_price=pricing.mid_price,
+                        inventory_skew=pricing.inventory_skew,
+                        volatility=pricing.volatility,
+                        kappa=pricing.kappa,
+                    )
+                else:
+                    # Zero out ask so only bid is placed
+                    pricing = PricingResult(
+                        reservation_price=pricing.reservation_price,
+                        optimal_spread=pricing.optimal_spread,
+                        bid_price=pricing.bid_price, ask_price=100.0,
+                        mid_price=pricing.mid_price,
+                        inventory_skew=pricing.inventory_skew,
+                        volatility=pricing.volatility,
+                        kappa=pricing.kappa,
+                    )
+                logger.info(
+                    f"Market {context.query_id}: liquidation skew q={q:.2f}, "
+                    f"quoting {'asks only' if q > 0 else 'bids only'}"
+                )
 
             # Execute order updates
             self._execute_order_updates(context, outcome, pricing)
@@ -1574,6 +1683,17 @@ class AvellanedaMarketMaker:
             Path(heartbeat_path).write_text(str(time.time()))
         except OSError:
             pass
+
+        # Log trading stats every 10 cycles
+        if self.stats.cycles % 10 == 0:
+            ts = self._trading_stats
+            logger.info(
+                f"Trading stats: bought={ts.total_shares_bought} "
+                f"(${ts.total_bought_value:.0f}), "
+                f"sold={ts.total_shares_sold} "
+                f"(${ts.total_sold_value:.0f}), "
+                f"net=${ts.total_sold_value - ts.total_bought_value:.0f}"
+            )
 
     def _cancel_all_active_orders(self) -> None:
         """Cancel all active orders (used when outside execution timeframe)."""
