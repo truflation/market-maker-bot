@@ -167,12 +167,22 @@ class MarketContext:
         """Get active orders for an outcome."""
         return self.yes_orders if outcome else self.no_orders
 
-    def get_mid_price(self, outcome: bool) -> Optional[float]:
+    def get_mid_price(self, outcome: bool, pricing_source: str = "order_book") -> Optional[float]:
         """
         Get mid price for an outcome.
 
+        Args:
+            outcome: True for YES, False for NO
+            pricing_source: "black_scholes" always returns B-S fair value,
+                            "order_book" uses order book mid with B-S fallback.
+
         Falls back to initial Black-Scholes price if no order book data.
         """
+        if pricing_source == "black_scholes":
+            # Always prefer B-S fair value
+            return self.initial_price_yes if outcome else self.initial_price_no
+
+        # Original logic: order book mid, fallback to initial price
         state = self.get_state(outcome)
         if state and state.mid_price is not None:
             return state.mid_price

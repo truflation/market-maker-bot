@@ -650,7 +650,7 @@ class AvellanedaMarketMaker:
             PricingResult or None if calculation not possible
         """
         # Get mid price (from order book or Black-Scholes fallback)
-        mid_price = context.get_mid_price(outcome)
+        mid_price = context.get_mid_price(outcome, self.config.pricing_source)
         if mid_price is None:
             logger.warning(
                 f"No mid price available for market {context.query_id} "
@@ -1412,19 +1412,27 @@ class AvellanedaMarketMaker:
             if self.config.avellaneda.hanging_orders_enabled:
                 self._process_hanging_orders(context, outcome)
 
-            # Check if we need initial pricing
-            state = context.get_state(outcome)
-            if state and not state.has_liquidity:
-                if context.get_mid_price(outcome) is None:
-                    initial_price = self._calculate_initial_price(context.config)
-                    if outcome:
-                        context.initial_price_yes = initial_price
-                    else:
-                        # NO fair value is complement of YES
-                        context.initial_price_no = 100 - initial_price
+            # Refresh pricing from Black-Scholes or order book
+            if self.config.pricing_source == "black_scholes":
+                # Always refresh B-S pricing each cycle
+                initial_price = self._calculate_initial_price(context.config)
+                if initial_price is not None:
+                    context.initial_price_yes = initial_price
+                    context.initial_price_no = 100 - initial_price
+            else:
+                # Original behavior: only calculate when no order book data
+                state = context.get_state(outcome)
+                if state and not state.has_liquidity:
+                    if context.get_mid_price(outcome) is None:
+                        initial_price = self._calculate_initial_price(context.config)
+                        if initial_price is not None:
+                            if outcome:
+                                context.initial_price_yes = initial_price
+                            else:
+                                context.initial_price_no = 100 - initial_price
 
             # Check for order_override
-            mid_price = context.get_mid_price(outcome)
+            mid_price = context.get_mid_price(outcome, self.config.pricing_source)
             if mid_price is not None:
                 override_proposals = self._create_proposal_from_order_override(mid_price)
                 if override_proposals:
@@ -1496,7 +1504,7 @@ class AvellanedaMarketMaker:
             outcome: True for YES, False for NO
         """
         tracker = self._get_hanging_tracker(context.query_id, outcome)
-        mid_price = context.get_mid_price(outcome)
+        mid_price = context.get_mid_price(outcome, self.config.pricing_source)
 
         if mid_price is None:
             return

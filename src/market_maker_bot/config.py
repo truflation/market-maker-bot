@@ -258,14 +258,14 @@ class AvellanedaConfig:
     volatility_min_samples: int = 10
 
     # Default volatility in cents when insufficient samples
-    default_volatility: float = 3.0
+    default_volatility: float = 0.10
 
     # Floor volatility in cents (never go below this)
-    min_volatility: float = 0.30
+    min_volatility: float = 0.01
 
     # Stream volatility parameters (for Black-Scholes initial pricing)
     stream_volatility_lookback_days: int = 14
-    stream_volatility_min: float = 0.30  # Minimum annual volatility (30%) - matches stream_volatility.py floor
+    stream_volatility_min: float = 0.01  # Minimum annual volatility (1%)
 
     # Maximum position per outcome per market (in shares)
     max_position_per_outcome: int = 50000
@@ -295,6 +295,12 @@ class BotConfig:
     # Polling intervals
     order_book_poll_interval: float = 2.0  # Seconds between order book polls
     inventory_refresh_interval: float = 30.0  # Seconds between inventory refresh
+
+    # Pricing source for mid-price determination
+    # "black_scholes" = always use B-S fair value from underlying stream data (recommended
+    #                    when there are few market participants)
+    # "order_book" = use order book mid price when available, B-S only for initial pricing
+    pricing_source: str = "black_scholes"
 
     # Operational settings
     dry_run: bool = False  # If True, log but don't execute orders
@@ -327,6 +333,7 @@ def load_config_from_dict(data: dict) -> BotConfig:
         avellaneda=avellaneda_config,
         order_book_poll_interval=data.get("order_book_poll_interval", 2.0),
         inventory_refresh_interval=data.get("inventory_refresh_interval", 30.0),
+        pricing_source=data.get("pricing_source", "black_scholes"),
         dry_run=data.get("dry_run", False),
         debug=data.get("debug", False),
         cancel_open_orders_on_exit=data.get("cancel_open_orders_on_exit", True),

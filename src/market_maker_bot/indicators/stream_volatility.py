@@ -303,7 +303,7 @@ def calculate_stream_volatility(
     monthly_lookback: int = 9999,
     hourly_threshold: int = 16,
     daily_threshold: int = 2,
-    min_volatility: float = 0.30,
+    min_volatility: float = 0.01,
 ) -> VolatilityResult:
     """
     Master function that automatically selects appropriate volatility calculation
