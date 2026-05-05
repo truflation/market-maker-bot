@@ -371,11 +371,28 @@ class AvellanedaMarketMaker:
         recovered = 0
         stale = 0
 
+        now_ts = int(time.time())
         for query_id, orders in orders_by_market.items():
             context = self._markets.get(query_id)
             if context is None:
                 # Market not configured anymore, clear its orders
                 logger.info(f"Market {query_id} no longer configured, clearing tracked orders")
+                self._order_state.clear_market(query_id)
+                stale += len(orders)
+                continue
+
+            # Prune already-settled markets up front so we don't try to query
+            # an order book that no longer exists. Without this guard, settled
+            # markets accumulate stale tracked orders forever across restarts
+            # (root cause of the orchestrator-shutdown bloat that wedged the
+            # main thread on 2026-05-01).
+            settle_time = context.config.settle_time
+            if settle_time is not None and now_ts >= settle_time:
+                logger.info(
+                    f"Market {query_id} already settled "
+                    f"(settle_time={settle_time}, now={now_ts}); clearing "
+                    f"{len(orders)} tracked orders"
+                )
                 self._order_state.clear_market(query_id)
                 stale += len(orders)
                 continue
@@ -444,7 +461,22 @@ class AvellanedaMarketMaker:
                             )
 
                 except Exception as e:
-                    logger.error(f"Failed to reconcile orders for market {query_id}: {e}")
+                    # Order book query failed (settled, market gone, RPC hiccup).
+                    # Untrack the tracked orders for this outcome rather than
+                    # carry them forward across restarts. Better to lose a few
+                    # legitimate tracked entries on a transient failure than
+                    # to accumulate thousands of stale ones over time.
+                    logger.error(
+                        f"Failed to reconcile orders for market {query_id} "
+                        f"outcome={outcome}: {e}; untracking {len(outcome_orders)} "
+                        f"orders defensively"
+                    )
+                    for tracked in outcome_orders:
+                        self._order_state.untrack_order(
+                            query_id, outcome, tracked.is_buy, tracked.price,
+                            tracked.level_idx,
+                        )
+                        stale += 1
 
         logger.info(f"Order reconciliation complete: {recovered} recovered, {stale} stale")
 
@@ -1704,43 +1736,72 @@ class AvellanedaMarketMaker:
             )
 
     def _cancel_all_active_orders(self) -> None:
-        """Cancel all active orders (used when outside execution timeframe)."""
+        """Cancel all active orders across ALL levels (off-hours / outside
+        execution timeframe). Mirrors the multi-level walk in
+        `_cancel_market_orders` (shutdown), but uses `wait=False` so this
+        non-shutdown path doesn't block on-chain confirmations.
+
+        Previously this only walked `orders.bid` / `orders.ask` (level 0),
+        leaving levels 1..N-1 on chain. Combined with periodic off-hours
+        cycles, that produced the stale-order state-bloat that wedged the
+        orchestrator on 2026-05-01 (#3).
+        """
         if self.config.dry_run:
             return
 
         for context in self._markets.values():
             for outcome in [True, False]:
                 orders = context.get_orders(outcome)
-                for side, order in [(Side.BID, orders.bid), (Side.ASK, orders.ask)]:
-                    if order is not None:
-                        try:
-                            if side == Side.ASK:
-                                # Split limit orders always land on the NO side
-                                cancel_outcome = False
-                                cancel_price = (100 - order.price) if outcome else order.price
-                            else:
-                                cancel_outcome = outcome
-                                cancel_price = convert_price_for_order(order.price, side)
+
+                # Walk multi-level bids and asks (levels 0..N-1).
+                all_orders = (
+                    [(Side.BID, i, o) for i, o in enumerate(orders.bids) if o is not None] +
+                    [(Side.ASK, i, o) for i, o in enumerate(orders.asks) if o is not None]
+                )
+                for side, lvl_idx, order in all_orders:
+                    try:
+                        if side == Side.ASK:
+                            # Ask orders exist on both sides (split mint + sell).
+                            # Cancel NO-side and YES-side legs. Best-effort:
+                            # an inner-leg failure is swallowed because the
+                            # other leg may still need to be cancelled.
+                            split_price = order.price if outcome else (100 - order.price)
+                            for cancel_out, cancel_p in [(False, 100 - split_price), (True, split_price)]:
+                                try:
+                                    self._client.cancel_order(
+                                        query_id=context.query_id,
+                                        outcome=cancel_out,
+                                        price=cancel_p,
+                                        wait=False,
+                                    )
+                                except Exception:
+                                    pass  # may already be filled/cancelled
+                        else:
+                            cancel_outcome = outcome
+                            cancel_price = convert_price_for_order(order.price, side)
                             self._client.cancel_order(
                                 query_id=context.query_id,
                                 outcome=cancel_outcome,
                                 price=cancel_price,
-                                wait=False,  # Don't wait
+                                wait=False,
                             )
-                            self._in_flight_cancels.add(
-                                f"{context.query_id}_{outcome}_{side.value}"
-                            )
-                            self.stats.orders_cancelled += 1
+                        self.stats.orders_cancelled += 1
 
-                            # Untrack the order
-                            self._order_state.untrack_order(
-                                query_id=context.query_id,
-                                outcome=outcome,
-                                is_buy=(side == Side.BID),
-                                price=order.price,
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to cancel order: {e}")
+                        # Untrack the order at the correct level so the
+                        # state file does not accumulate stale entries
+                        # for levels we just cancelled.
+                        self._order_state.untrack_order(
+                            query_id=context.query_id,
+                            outcome=outcome,
+                            is_buy=(side == Side.BID),
+                            price=order.price,
+                            level_idx=lvl_idx,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to cancel {side.value} L{lvl_idx} for market "
+                            f"{context.query_id}: {e}"
+                        )
 
     def _shutdown(self) -> None:
         """Graceful shutdown - optionally cancel all orders based on config."""
