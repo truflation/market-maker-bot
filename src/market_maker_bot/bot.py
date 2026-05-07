@@ -400,7 +400,17 @@ class AvellanedaMarketMaker:
         # Import TNClient at runtime to avoid segfaults when Go bindings aren't available
         from trufnetwork_sdk_py.client import TNClient
 
-        logger.info(f"Connecting to {self.config.node_url}")
+        # Pre-flight: derive the wallet address from the private key and
+        # log it alongside the gateway URL. Op-time sanity check — if these
+        # don't match what the operator expected (wrong env file, wrong
+        # network, copy-paste error), this is the last log line before any
+        # broadcast so it's easy to ctrl-C.
+        wallet_addr = self._derive_wallet_address(self.config.private_key)
+        logger.info(
+            "Connecting to %s as wallet %s (read_only=%s)",
+            self.config.node_url, wallet_addr, self.config.read_only,
+        )
+
         real_client = TNClient(
             url=self.config.node_url,
             token=self.config.private_key,
@@ -414,6 +424,17 @@ class AvellanedaMarketMaker:
             self._client = ReadOnlyTNClient(real_client)
         else:
             self._client = real_client
+
+    @staticmethod
+    def _derive_wallet_address(private_key: str) -> str:
+        """Derive the 0x-prefixed Ethereum address from a hex private key.
+        Returns "<unknown>" on any failure rather than raising — the address
+        is for logging only, not authorization."""
+        try:
+            from eth_account import Account
+            return Account.from_key(private_key).address
+        except Exception:
+            return "<unknown>"
 
     def _setup_signal_handlers(self) -> None:
         """Set up graceful shutdown handlers."""
@@ -734,12 +755,20 @@ class AvellanedaMarketMaker:
     def _pre_mint_all_markets(self) -> None:
         """
         Walk every configured market and bring pair inventory up to the
-        per-market `initial_mint_pairs` target via a one-time split-mint at
-        an unreachable park price (default 99c YES), then cancel the auto-
-        listed legs so we hold pure inventory.
+        per-market `initial_mint_pairs` target via a one-time split-mint
+        whose only auto-listed leg parks at an unreachable price.
 
-        Idempotent: per market the deficit is `target - paired_inventory()`,
+        SDK semantics (per place_split_limit_order doc): mints `amount`
+        YES+NO pairs from collateral and auto-lists the NO side at
+        `100 - true_price`. Setting true_price=1 puts the NO leg at 99c
+        — no rational counterparty buys NO at 99c on a sub-1.0-prior
+        market — so any race between mint and cancel cannot bleed shares.
+
+        Idempotent: per market the deficit is `target - paired_inventory()`
         clamped to 0. Subsequent restarts with full inventory mint nothing.
+        Pre-mint is skipped if a market is within `pre_settlement_cutoff +
+        300s` of settling (no point minting into a market we're about to
+        liquidate).
 
         Skipped in dry_run / read_only modes (the SDK is either uninit'd or
         broadcasts are short-circuited, so split_limit_order would either
@@ -758,11 +787,24 @@ class AvellanedaMarketMaker:
 
         # Compute per-market deficits up front so we can apply the global
         # collateral cap before any broadcast.
+        now_ts = int(time.time())
+        # Skip markets that will start liquidating soon. The +300s buffer
+        # over pre_settlement_cutoff is to keep the mint+cancel sequence
+        # well clear of the liquidation window even if RPCs are slow.
+        cutoff_buffer = self.config.pre_settlement_cutoff + 300
         deficits: dict[int, int] = {}
         total_deficit_pairs = 0
         for query_id, context in self._markets.items():
             target = context.config.initial_mint_pairs
             if not target or target <= 0:
+                continue
+            settle_time = context.config.settle_time
+            if settle_time is not None and (settle_time - now_ts) <= cutoff_buffer:
+                logger.info(
+                    "Pre-mint skip market %d: settle_time=%d is within "
+                    "%ds of cutoff",
+                    query_id, settle_time, cutoff_buffer,
+                )
                 continue
             inv = self._inventory.get_market_inventory(query_id)
             paired = inv.paired_inventory()
@@ -791,13 +833,29 @@ class AvellanedaMarketMaker:
             logger.error("pre_mint_listing_price_yes_cents must be 1-99, got %d", park_price)
             return
 
+        # Pre-flight log: gateway URL + estimated capital + park price. If
+        # any of these don't match what the operator expected, this is the
+        # last chance to ctrl-C before broadcasting.
         logger.info(
-            "Pre-minting: %d markets need mint, total %d pairs ($%d collateral); "
-            "park price = %dc YES (auto-listed legs will be cancelled)",
-            len(deficits), total_deficit_pairs, total_deficit_pairs, park_price,
+            "Pre-mint pre-flight: gateway=%s, deficit=%d pairs ($%d collateral) "
+            "across %d markets, park price true_price=%d (auto-lists NO at %dc)",
+            self.config.node_url, total_deficit_pairs, total_deficit_pairs,
+            len(deficits), park_price, 100 - park_price,
         )
 
         for query_id, deficit in deficits.items():
+            # Honor SIGTERM mid-pre-mint. Without this, an early shutdown
+            # signal is queued but the pre-mint loop runs to completion,
+            # which on 35 markets can take long enough for systemd to
+            # SIGKILL the bot. Check between markets.
+            if self._shutdown_requested:
+                logger.info(
+                    "Pre-mint interrupted by shutdown request after "
+                    "broadcasting %d/%d markets",
+                    len(deficits) - sum(1 for q in deficits if q >= query_id),
+                    len(deficits),
+                )
+                break
             try:
                 self._client.place_split_limit_order(
                     query_id=query_id,
@@ -813,24 +871,30 @@ class AvellanedaMarketMaker:
                 )
                 continue
 
-            # Cancel both auto-listed legs (YES at park_price, NO at 100-park_price).
-            # Best-effort: a leg that fails to cancel will sit at an unreachable
-            # price and either get re-detected on the next refresh cycle or
-            # simply never fill. Don't propagate failure.
-            for cancel_outcome, cancel_p in [(True, park_price), (False, 100 - park_price)]:
-                try:
-                    self._client.cancel_order(
-                        query_id=query_id,
-                        outcome=cancel_outcome,
-                        price=cancel_p,
-                        wait=True,
-                    )
-                except Exception:
-                    pass  # tolerated; see comment above
+            # Cancel only the auto-listed NO leg at 100-park_price. The
+            # SDK does NOT auto-list a YES leg here (split-mint lists the
+            # "unwanted side" only — see place_split_limit_order doc).
+            # An earlier draft also cancelled YES at park_price; that
+            # call always failed (no such order existed) and was a wasted
+            # round-trip.
+            try:
+                self._client.cancel_order(
+                    query_id=query_id,
+                    outcome=False,
+                    price=100 - park_price,
+                    wait=True,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Pre-mint cancel of auto-listed NO@%dc on market %d "
+                    "failed: %s. Leg may sit on book until next refresh; "
+                    "since park price is unreachable, fill risk is low.",
+                    100 - park_price, query_id, e,
+                )
 
             logger.info(
-                "Pre-minted %d pairs on market %d (auto-list legs cancelled)",
-                deficit, query_id,
+                "Pre-minted %d pairs on market %d (NO@%dc auto-list cancelled)",
+                deficit, query_id, 100 - park_price,
             )
 
         # Refresh inventory once so the new shares show up in available()
@@ -1372,7 +1436,7 @@ class AvellanedaMarketMaker:
                 )
                 raise
             inv.reserve_pair(outcome, amount)
-            logger.debug(
+            logger.info(
                 f"Inventory-backed ask qid={context.query_id} "
                 f"outcome={'YES' if outcome else 'NO'} {new_price}c x{amount} "
                 f"(avail before/after: {available}/{available - amount})"
@@ -1427,6 +1491,7 @@ class AvellanedaMarketMaker:
         price: int,
         amount: int,
         is_inventory_backed: bool,
+        wait: bool = True,
     ) -> None:
         """
         Cancel an ASK previously placed by the bot. The split-mint path
@@ -1436,6 +1501,14 @@ class AvellanedaMarketMaker:
 
         Releases the inventory reservation either way (the legacy split-mint
         path never reserved, so release is a no-op there).
+
+        wait=True (default) is required when this cancel is followed by a
+        new ASK placement against the same shares — otherwise the new
+        place broadcasts before the chain has accepted the cancel, and
+        the second order silently reverts on insufficient inventory (same
+        class of silent-failure bug as PR#13's min-notional issue). Use
+        wait=False only for bulk shutdown / off-hours cancels where no
+        immediate placement follows.
         """
         inv = self._inventory.get_market_inventory(context.query_id)
         if is_inventory_backed:
@@ -1444,7 +1517,7 @@ class AvellanedaMarketMaker:
                     query_id=context.query_id,
                     outcome=outcome,
                     price=price,
-                    wait=False,
+                    wait=wait,
                 )
             except Exception:
                 pass  # may already be filled/cancelled
@@ -1457,7 +1530,7 @@ class AvellanedaMarketMaker:
                         query_id=context.query_id,
                         outcome=cancel_out,
                         price=cancel_p,
-                        wait=False,
+                        wait=wait,
                     )
                 except Exception:
                     pass
@@ -2193,13 +2266,16 @@ class AvellanedaMarketMaker:
                         if side == Side.ASK:
                             # Inventory-backed asks are single-leg; split-mint
                             # asks live on both sides of the book. Branch via
-                            # the recorded flag on the BotOrder.
+                            # the recorded flag on the BotOrder. wait=False
+                            # because this is a bulk off-hours cancel; no new
+                            # placement follows.
                             self._cancel_ask(
                                 context=context,
                                 outcome=outcome,
                                 price=order.price,
                                 amount=order.amount,
                                 is_inventory_backed=order.is_inventory_backed,
+                                wait=False,
                             )
                         else:
                             cancel_outcome = outcome
