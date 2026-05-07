@@ -1499,16 +1499,24 @@ class AvellanedaMarketMaker:
         100-split_price), so we must cancel both. The inventory path
         listed only the single side at the quote price.
 
-        Releases the inventory reservation either way (the legacy split-mint
-        path never reserved, so release is a no-op there).
+        Behavior on chain-cancel failure:
+        - wait=True: propagate the exception. Caller (refresh path or
+          synchronous shutdown) decides whether to untrack/release. This
+          is critical for keeping bot state consistent with chain when a
+          cancel fails — otherwise an order on chain would be silently
+          marked gone in the bot's state and its inventory reservation
+          released, leaving the next placement free to double-list the
+          same shares (silent-revert pattern from PR#13).
+        - wait=False: best-effort fire-and-forget; failures are swallowed
+          because we cannot distinguish broadcast-failed-on-chain from
+          confirmed-cancelled when not waiting. Reservation is released
+          regardless. Caller is expected to be a bulk cancel (off-hours /
+          shutdown) with reconcile-on-startup handling any orphans.
 
-        wait=True (default) is required when this cancel is followed by a
-        new ASK placement against the same shares — otherwise the new
-        place broadcasts before the chain has accepted the cancel, and
-        the second order silently reverts on insufficient inventory (same
-        class of silent-failure bug as PR#13's min-notional issue). Use
-        wait=False only for bulk shutdown / off-hours cancels where no
-        immediate placement follows.
+        wait=True is required when this cancel is followed by a new ASK
+        placement against the same shares — otherwise the new place
+        broadcasts before the chain has accepted the cancel, and the
+        second order silently reverts on insufficient inventory.
         """
         inv = self._inventory.get_market_inventory(context.query_id)
         if is_inventory_backed:
@@ -1520,10 +1528,16 @@ class AvellanedaMarketMaker:
                     wait=wait,
                 )
             except Exception:
-                pass  # may already be filled/cancelled
+                if wait:
+                    # Do not release the reservation: the order may still
+                    # be on chain; let the caller's exception handler skip
+                    # untrack so reconcile picks it up next cycle.
+                    raise
+                # wait=False: best-effort, fall through to release.
             inv.release_pair(outcome, amount)
         else:
             split_price = price if outcome else (100 - price)
+            any_failed = False
             for cancel_out, cancel_p in [(False, 100 - split_price), (True, split_price)]:
                 try:
                     self._client.cancel_order(
@@ -1533,7 +1547,13 @@ class AvellanedaMarketMaker:
                         wait=wait,
                     )
                 except Exception:
-                    pass
+                    any_failed = True
+            if any_failed and wait:
+                raise RuntimeError(
+                    f"split-mint cancel partially failed for "
+                    f"qid={context.query_id} outcome={outcome} price={price}; "
+                    f"orders may remain on book and reconcile will recover them"
+                )
 
     def _update_single_order(
         self,
@@ -1828,7 +1848,19 @@ class AvellanedaMarketMaker:
             return None
 
     def _cancel_market_orders(self, context: MarketContext) -> None:
-        """Cancel all orders for a market during shutdown."""
+        """Cancel all orders for a market during shutdown / pre-settlement.
+
+        Uses wait=False for the cancels themselves: with order counts in
+        the 100s, sequential wait=True cancels at ~1-2s each can blow past
+        the orchestrator's market_maker_timeout (300s) and trigger SIGKILL
+        mid-cancel. wait=False broadcasts and returns; reconcile-on-startup
+        on the next bot lifetime catches any cancel that didn't actually
+        land on chain (the order will still appear in get_order_book and
+        get re-recorded). Untrack runs unconditionally because we cannot
+        distinguish broadcast-but-failed from confirmed-cancelled in this
+        mode — accepting the small state-vs-chain divergence is strictly
+        better than the SIGKILL alternative.
+        """
         for outcome in [True, False]:
             orders = context.get_orders(outcome)
 
@@ -1851,6 +1883,7 @@ class AvellanedaMarketMaker:
                             price=order.price,
                             amount=order.amount,
                             is_inventory_backed=order.is_inventory_backed,
+                            wait=False,
                         )
                     else:
                         cancel_outcome = outcome
@@ -1859,7 +1892,7 @@ class AvellanedaMarketMaker:
                             query_id=context.query_id,
                             outcome=cancel_outcome,
                             price=cancel_price,
-                            wait=True,
+                            wait=False,
                         )
                     self.stats.orders_cancelled += 1
 
