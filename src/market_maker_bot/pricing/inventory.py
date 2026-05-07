@@ -42,6 +42,19 @@ class MarketInventory:
     reserved_yes_sells: int = 0
     reserved_no_sells: int = 0
 
+    # Shares CURRENTLY LISTED on chain as sell orders (any source: bot's own
+    # split-mint asks, bot's own inventory-backed asks, or orphan auto-listed
+    # legs from a partially-completed pre-mint). Distinct from yes_shares /
+    # no_shares (which only count `price=0` held). Populated each refresh
+    # from `get_user_positions` entries with `price > 0`.
+    # paired_inventory() needs to count these because the underlying pair
+    # collateral is still committed (the listed leg can be cancelled to
+    # return to held inventory). Without this, a crash between split-mint
+    # broadcast and the cancel of the auto-listed leg would cause the
+    # next pre-mint to under-count owned pairs and double-mint.
+    chain_listed_yes_sells: int = 0
+    chain_listed_no_sells: int = 0
+
     def reserve_pair(self, outcome: bool, n: int) -> None:
         """Reserve n shares for an inventory-backed ASK. outcome=True debits
         from YES side, outcome=False from NO side. No-op if n <= 0."""
@@ -71,10 +84,18 @@ class MarketInventory:
         return max(0, held - reserved)
 
     def paired_inventory(self) -> int:
-        """Number of fully-paired (1 YES + 1 NO) units we hold. Pre-mint
-        deficit math runs against this since unpaired imbalance from prior
-        fills can't be relied on to back ask pairs the bot wants to write."""
-        return min(self.yes_shares, self.no_shares)
+        """Number of fully-paired (1 YES + 1 NO) units we own on this market,
+        including shares currently listed as sell orders (whose underlying
+        collateral is still ours — a listed YES sell at 99c is just a held
+        YES share with a pending sale; if we cancel the sell, the share
+        returns to held inventory).
+
+        Pre-mint deficit math runs against THIS, not held alone, so a crash
+        between split-mint and auto-leg cancel does not cause the next
+        startup to under-count owned pairs and double-mint."""
+        total_yes = self.yes_shares + self.chain_listed_yes_sells
+        total_no = self.no_shares + self.chain_listed_no_sells
+        return min(total_yes, total_no)
 
     def update_from_positions(
         self,
@@ -82,20 +103,32 @@ class MarketInventory:
         no_shares: int,
         yes_bid_collateral: Decimal = Decimal("0"),
         no_bid_collateral: Decimal = Decimal("0"),
+        chain_listed_yes_sells: int = 0,
+        chain_listed_no_sells: int = 0,
     ) -> None:
         """
-        Update inventory from position data.
+        Update inventory from position data. NOTE: held + listed totals
+        come from chain truth and OVERWRITE the cached values; reservation
+        counters (reserved_*_sells) are bot-side state and are NOT touched
+        here, because a fresh chain snapshot does not invalidate the bot's
+        in-flight intent to list shares.
 
         Args:
-            yes_shares: Number of YES shares held
-            no_shares: Number of NO shares held
-            yes_bid_collateral: USD locked in YES bid orders
-            no_bid_collateral: USD locked in NO bid orders
+            yes_shares: Number of YES shares held (`price=0` entries).
+            no_shares: Number of NO shares held.
+            yes_bid_collateral: USD locked in YES bid orders.
+            no_bid_collateral: USD locked in NO bid orders.
+            chain_listed_yes_sells: Shares listed as YES sell orders on chain
+                (`price>0, outcome=True` entries). Counted in paired_inventory
+                but NOT in available_for_sell.
+            chain_listed_no_sells: Same for NO sell orders.
         """
         self.yes_shares = yes_shares
         self.no_shares = no_shares
         self.usd_locked_yes_bids = yes_bid_collateral
         self.usd_locked_no_bids = no_bid_collateral
+        self.chain_listed_yes_sells = chain_listed_yes_sells
+        self.chain_listed_no_sells = chain_listed_no_sells
 
     def get_share_value(self, outcome: bool, mid_price: float) -> Decimal:
         """
@@ -268,22 +301,34 @@ class InventoryManager:
                     "no_shares": 0,
                     "yes_bid_value": 0,
                     "no_bid_value": 0,
+                    "yes_listed_sells": 0,
+                    "no_listed_sells": 0,
                 }
 
-            # price == 0 means holding, price < 0 means bid
+            # Signed-price convention from get_user_positions:
+            #   price == 0  -> holding
+            #   price <  0  -> open buy_order (signed-negative)
+            #   price >  0  -> open sell_order
             if price == 0:
-                # Holdings
                 if outcome:
                     by_market[query_id]["yes_shares"] += amount
                 else:
                     by_market[query_id]["no_shares"] += amount
             elif price < 0:
-                # Open bid (buy order) - collateral locked
                 collateral = abs(price) * amount  # In cents
                 if outcome:
                     by_market[query_id]["yes_bid_value"] += collateral
                 else:
                     by_market[query_id]["no_bid_value"] += collateral
+            else:
+                # Open sell_order. Counted into pair-inventory accounting
+                # (not into available_for_sell), so a partial pre-mint that
+                # left an auto-listed leg on the book is not double-minted
+                # on restart.
+                if outcome:
+                    by_market[query_id]["yes_listed_sells"] += amount
+                else:
+                    by_market[query_id]["no_listed_sells"] += amount
 
         # Update each market's inventory
         for query_id, data in by_market.items():
@@ -293,6 +338,8 @@ class InventoryManager:
                 no_shares=data["no_shares"],
                 yes_bid_collateral=Decimal(str(data["yes_bid_value"] / 100)),
                 no_bid_collateral=Decimal(str(data["no_bid_value"] / 100)),
+                chain_listed_yes_sells=data["yes_listed_sells"],
+                chain_listed_no_sells=data["no_listed_sells"],
             )
 
         logger.debug(f"Updated inventory for {len(by_market)} markets")

@@ -315,11 +315,17 @@ class AvellanedaConfig:
     # _amount * mint_cushion_multiplier). Lives here (vs MarketConfig) so the
     # multiplier is a single deployment-wide knob.
     mint_cushion_multiplier: float = 1.0
-    # Price at which the auto-listed YES leg of the bootstrap split-mint sits
-    # before being cancelled. 99c is the safest "park" price because no fair-
-    # value strategy will buy YES at 99c on a sub-1.00 prior, so accidental
-    # fills before the cancel land are nearly impossible.
-    pre_mint_listing_price_yes_cents: int = 99
+    # `true_price` we pass to place_split_limit_order during pre-mint. The
+    # SDK mints a YES+NO pair and auto-lists the NO side at `100 - true_price`
+    # (per the SDK doc: "list unwanted side"). We want the auto-listed leg
+    # parked at an unreachable price so any race between mint and cancel
+    # cannot give shares away. Therefore set true_price=1, which puts the
+    # NO leg at 99c — no rational counterparty buys NO at 99c on a market
+    # with prior > 0.01. Earlier code used true_price=99 which mistakenly
+    # parked the NO leg at 1c (a giveaway; reviewers flagged ~$1K worst-
+    # case loss across 35 markets if all auto-listed legs were sniped
+    # before cancellation).
+    pre_mint_listing_price_yes_cents: int = 1
 
     def __post_init__(self):
         """Catch silently-contradictory config values that would otherwise
