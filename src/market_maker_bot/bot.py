@@ -56,11 +56,81 @@ SETTLED_MARKET_ERRORS = (
 )
 
 
+# Minimum order notional enforced by TN's prediction-market protocol.
+# All current markets (6-dec USDC mainnet and 18-dec TT2 testnet) use
+# "1 token unit" as the minimum, which is exactly 100 in cent-shares
+# (price * amount) for both decimals (1e6/1e4 == 1e18/1e16 == 100).
+# Orders below this silently fail to land on chain: the SDK returns a
+# tx_hash but the on-chain action reverts, leaving the bot's state file
+# tracking phantom orders that don't exist.
+#
+# When TN starts allowing other per-market minimums we should source
+# this from market_config.min_order_size (currently not threaded through
+# from the orchestrator's market discovery; tracked as follow-up).
+MIN_ORDER_NOTIONAL_CENT_SHARES = 100
+
+
+def _meets_min_notional(price: int, amount: int) -> bool:
+    """Does an order of `amount` shares at `price` cents clear the protocol's
+    minimum notional? See the comment on MIN_ORDER_NOTIONAL_CENT_SHARES."""
+    return price * amount >= MIN_ORDER_NOTIONAL_CENT_SHARES
+
+
+def _compute_base_amount(market_config, price_cents: int) -> int:
+    """Resolve the per-leg base order amount before eta/level adjustments.
+
+    If `order_dollar_amount` is set on the market config, size the leg so
+    its notional approximates that dollar target at the current leg price:
+    amount = round(X * 100 / price). Otherwise fall back to the static
+    `order_amount` share count. Floored at 1 share so we never compute 0.
+    """
+    dollar_target = getattr(market_config, "order_dollar_amount", None)
+    if dollar_target is not None and price_cents > 0:
+        return max(1, round(dollar_target * 100 / price_cents))
+    return market_config.order_amount
+
+
 class MarketSettledError(Exception):
     """Raised when an operation targets a market that has already settled."""
     def __init__(self, query_id: int):
         self.query_id = query_id
         super().__init__(f"Market {query_id} has settled")
+
+
+class ReadOnlyTNClient:
+    """Wraps a TNClient. Read methods pass through; broadcast/write methods
+    are logged and short-circuited so the bot can do a Phase-1-style dry run
+    against a real chain without committing transactions.
+
+    Distinct from `dry_run`, which skips client init entirely (so even reads
+    fail). Use `read_only` when you want the bot to fully connect, fetch
+    stream records and order books, compute prices, and log what it WOULD
+    do, but not actually broadcast.
+    """
+
+    # SDK methods that produce on-chain transactions. Anything else passes
+    # straight through to the wrapped client.
+    _WRITE_METHODS = frozenset({
+        "place_buy_order",
+        "place_sell_order",
+        "place_split_limit_order",
+        "cancel_order",
+        "settle_market",
+    })
+
+    def __init__(self, real_client):
+        self._client = real_client
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if name in self._WRITE_METHODS and callable(attr):
+            def stub(*args, **kwargs):
+                logger.info(
+                    f"[READ-ONLY] suppressed {name}(args={args!r}, kwargs={kwargs!r})"
+                )
+                return f"read_only_stub_tx_{name}"
+            return stub
+        return attr
 
 
 @dataclass
@@ -151,11 +221,28 @@ class AvellanedaMarketMaker:
         # Order state persistence (for restart recovery)
         self._order_state = OrderStateManager(config.order_state_file)
 
-        # Derive pre_settlement_pulled persistence path from order_state_file
+        # Derive pre_settlement_pulled persistence path from order_state_file.
+        # Include the state file's stem so a second MM bot instance with a
+        # different order_state_file (e.g. mainnet) gets its own
+        # pre_settlement file rather than sharing one with testnet.
         state_path = Path(config.order_state_file)
         self._pre_settlement_file = str(
-            state_path.parent / "pre_settlement_pulled.json"
+            state_path.parent / f"{state_path.stem}_pre_settlement_pulled.json"
         )
+        # One-time migration: if an old shared `pre_settlement_pulled.json`
+        # exists at the same parent and the new per-stem file does not,
+        # rename it into place. Keeps the existing testnet bot from losing
+        # its pre-settlement state on the upgrade.
+        legacy = state_path.parent / "pre_settlement_pulled.json"
+        new_path = Path(self._pre_settlement_file)
+        if legacy.exists() and not new_path.exists():
+            try:
+                legacy.rename(new_path)
+                logger.info(
+                    f"Migrated pre_settlement_pulled file: {legacy.name} -> {new_path.name}"
+                )
+            except OSError as e:
+                logger.warning(f"Failed to migrate {legacy}: {e}")
         self._load_pre_settlement_pulled()
 
     def _create_execution_state(self) -> ExecutionState:
@@ -314,10 +401,19 @@ class AvellanedaMarketMaker:
         from trufnetwork_sdk_py.client import TNClient
 
         logger.info(f"Connecting to {self.config.node_url}")
-        self._client = TNClient(
+        real_client = TNClient(
             url=self.config.node_url,
             token=self.config.private_key,
         )
+
+        if self.config.read_only:
+            logger.info(
+                "[READ-ONLY] Wrapping TNClient: reads pass through, writes "
+                "(place/cancel/settle) are logged and suppressed."
+            )
+            self._client = ReadOnlyTNClient(real_client)
+        else:
+            self._client = real_client
 
     def _setup_signal_handlers(self) -> None:
         """Set up graceful shutdown handlers."""
@@ -440,7 +536,18 @@ class AvellanedaMarketMaker:
                             order_mgr.record_order(
                                 outcome, side, tracked.price, tracked.amount, tracked.order_id,
                                 tracked.level_idx,
+                                is_inventory_backed=tracked.is_inventory_backed,
                             )
+                            # Re-populate inventory reservation so available
+                            # inventory accounting is correct from the first
+                            # cycle. Without this, a recovered inventory-backed
+                            # ASK would be invisible to _place_ask's available
+                            # check and the bot could double-list the same
+                            # shares on a refresh.
+                            if side == Side.ASK and tracked.is_inventory_backed:
+                                self._inventory.get_market_inventory(query_id).reserve_pair(
+                                    outcome, tracked.amount
+                                )
                             recovered += 1
                             logger.debug(
                                 f"Recovered order: market {query_id} "
@@ -484,14 +591,41 @@ class AvellanedaMarketMaker:
         self, market_config: MarketConfig
     ) -> Optional[float]:
         """
-        Calculate initial price using Black-Scholes when no order book exists.
+        Calculate initial fair-YES price (in cents, 1-99) when no order book
+        exists yet.
 
-        Args:
-            market_config: Market configuration with stream info
+        Two paths:
+        1. If ``market_config.initial_probability`` is set, use it directly:
+           fair_yes_cents = round(initial_probability * 100), clamped to [1, 99].
+           Used by Hormuz markets that ship a per-bucket prior because their
+           underlying stream has too little history (and a degenerate spot=0
+           in the closed-strait regime) for B-S to produce a useful prior.
+        2. Otherwise, run Black-Scholes against the stream history. Used by
+           CPI markets with rich monthly history.
 
-        Returns:
-            Fair value in cents (1-99), or None if calculation fails
+        Note on fallback: under ``pricing_source="black_scholes"`` (the
+        mainnet setting), MarketContext.get_mid_price always returns the
+        initial price, NOT the order-book mid. So this prior is effectively
+        a permanent fair-value override for Hormuz, not a transient seed.
+        Only ``pricing_source="order_book"`` falls back to mid as the order
+        book accumulates liquidity.
         """
+        # Fixed-prior short-circuit. No SDK call needed; same value every cycle.
+        if market_config.initial_probability is not None:
+            prior = market_config.initial_probability
+            if not (0.0 <= prior <= 1.0):
+                logger.warning(
+                    f"Market {market_config.query_id}: initial_probability "
+                    f"{prior} out of [0, 1]; falling back to B-S"
+                )
+            else:
+                fair_cents = max(1, min(99, int(round(prior * 100))))
+                logger.info(
+                    f"Market {market_config.query_id}: prior fair-YES "
+                    f"= {prior:.4f} -> {fair_cents}c (no B-S)"
+                )
+                return float(fair_cents)
+
         try:
             # Fetch stream records with explicit date range.
             # 365 days ensures enough history for monthly streams;
@@ -515,13 +649,19 @@ class AvellanedaMarketMaker:
             if records and hasattr(records[0], "dict"):
                 records = [r.dict() if hasattr(r, "dict") else r for r in records]
 
-            # Get current spot value
+            # Get current spot value. Negative values are still rejected as
+            # nonsense, but zero is a valid spot for streams whose underlying
+            # observable can legitimately be zero (e.g. the Hormuz Index ship
+            # count during a closed-strait regime). Clamp to a tiny positive
+            # epsilon so Black-Scholes, which needs log(spot), stays defined.
             spot = get_current_spot_value(records)
-            if spot <= 0:
+            if spot < 0:
                 logger.warning(
                     f"Invalid spot value {spot} for market {market_config.query_id}"
                 )
                 return None
+            if spot == 0:
+                spot = 1e-9
 
             # Calculate stream volatility
             vol_result = calculate_stream_volatility(
@@ -590,6 +730,112 @@ class AvellanedaMarketMaker:
                 f"Failed to calculate initial price for market {market_config.query_id}: {e}"
             )
             return None
+
+    def _pre_mint_all_markets(self) -> None:
+        """
+        Walk every configured market and bring pair inventory up to the
+        per-market `initial_mint_pairs` target via a one-time split-mint at
+        an unreachable park price (default 99c YES), then cancel the auto-
+        listed legs so we hold pure inventory.
+
+        Idempotent: per market the deficit is `target - paired_inventory()`,
+        clamped to 0. Subsequent restarts with full inventory mint nothing.
+
+        Skipped in dry_run / read_only modes (the SDK is either uninit'd or
+        broadcasts are short-circuited, so split_limit_order would either
+        crash or no-op silently — neither is what we want).
+
+        Honors `pre_mint_max_total_collateral_usd` as a wallet circuit
+        breaker: if total deficit across all markets would exceed this
+        cap, abort startup before broadcasting any mint.
+        """
+        if self.config.dry_run or self.config.read_only:
+            logger.info(
+                "[%s] skipping pre-mint",
+                "DRY RUN" if self.config.dry_run else "READ-ONLY",
+            )
+            return
+
+        # Compute per-market deficits up front so we can apply the global
+        # collateral cap before any broadcast.
+        deficits: dict[int, int] = {}
+        total_deficit_pairs = 0
+        for query_id, context in self._markets.items():
+            target = context.config.initial_mint_pairs
+            if not target or target <= 0:
+                continue
+            inv = self._inventory.get_market_inventory(query_id)
+            paired = inv.paired_inventory()
+            deficit = max(0, int(target) - int(paired))
+            if deficit > 0:
+                deficits[query_id] = deficit
+                total_deficit_pairs += deficit
+
+        if not deficits:
+            logger.info("Pre-mint: no deficit across %d markets", len(self._markets))
+            return
+
+        cap = self.config.pre_mint_max_total_collateral_usd
+        if cap is not None and total_deficit_pairs > cap:
+            logger.error(
+                "Pre-mint aborted: total deficit %d pairs ($%d) exceeds "
+                "pre_mint_max_total_collateral_usd=%.2f. Either lower per-"
+                "market initial_mint_pairs in orchestrator config or raise "
+                "the cap if intentional.",
+                total_deficit_pairs, total_deficit_pairs, cap,
+            )
+            raise RuntimeError("pre_mint_max_total_collateral_usd exceeded")
+
+        park_price = int(self.config.avellaneda.pre_mint_listing_price_yes_cents)
+        if not (1 <= park_price <= 99):
+            logger.error("pre_mint_listing_price_yes_cents must be 1-99, got %d", park_price)
+            return
+
+        logger.info(
+            "Pre-minting: %d markets need mint, total %d pairs ($%d collateral); "
+            "park price = %dc YES (auto-listed legs will be cancelled)",
+            len(deficits), total_deficit_pairs, total_deficit_pairs, park_price,
+        )
+
+        for query_id, deficit in deficits.items():
+            try:
+                self._client.place_split_limit_order(
+                    query_id=query_id,
+                    true_price=park_price,
+                    amount=deficit,
+                    wait=True,
+                )
+            except Exception as e:
+                logger.error(
+                    "Pre-mint failed for market %d (deficit=%d pairs): %s. "
+                    "Bot will fall back to per-cycle split-mint for this market.",
+                    query_id, deficit, e,
+                )
+                continue
+
+            # Cancel both auto-listed legs (YES at park_price, NO at 100-park_price).
+            # Best-effort: a leg that fails to cancel will sit at an unreachable
+            # price and either get re-detected on the next refresh cycle or
+            # simply never fill. Don't propagate failure.
+            for cancel_outcome, cancel_p in [(True, park_price), (False, 100 - park_price)]:
+                try:
+                    self._client.cancel_order(
+                        query_id=query_id,
+                        outcome=cancel_outcome,
+                        price=cancel_p,
+                        wait=True,
+                    )
+                except Exception:
+                    pass  # tolerated; see comment above
+
+            logger.info(
+                "Pre-minted %d pairs on market %d (auto-list legs cancelled)",
+                deficit, query_id,
+            )
+
+        # Refresh inventory once so the new shares show up in available()
+        # before any ASK placement runs.
+        self._refresh_inventory()
 
     def _refresh_inventory(self) -> None:
         """Refresh inventory from user positions."""
@@ -978,15 +1224,11 @@ class AvellanedaMarketMaker:
             refresh_tolerance_pct=self.config.avellaneda.order_refresh_tolerance_pct,
             max_order_age=self.config.avellaneda.max_order_age,
         )
+        # Static (share-count) base amount; only used when order_dollar_amount
+        # is unset. With order_dollar_amount set, base is recomputed per leg
+        # below using each level's price so each individual placed order
+        # targets a fixed dollar notional.
         base_amount = context.config.order_amount
-
-        # Apply eta transformation to order amounts
-        bid_amount = self._apply_eta_transformation(
-            base_amount, pricing.inventory_skew, is_buy=True
-        )
-        ask_amount = self._apply_eta_transformation(
-            base_amount, pricing.inventory_skew, is_buy=False
-        )
 
         # Apply order optimization (jump to best bid+1 / best ask-1)
         bid_price, ask_price = self._apply_order_optimization(
@@ -999,6 +1241,22 @@ class AvellanedaMarketMaker:
             bid_price, ask_price, fee_pct=0.0
         )
 
+        # Defensive self-match check. After all the optimization+transaction
+        # steps above, verify bid < ask within this (market, outcome). The
+        # pricing module already widens crossing extremes inline (see
+        # avellaneda.py around the bid_price/ask_price clamp + recovery), but
+        # apply a belt-and-suspenders gate here in case a downstream step
+        # (rounding, order optimization, fee adjustment) crosses the prices.
+        # Skip the whole update for this outcome rather than place a
+        # self-crossing pair.
+        if bid_price >= ask_price:
+            logger.warning(
+                f"Market {context.query_id} outcome={outcome}: bid {bid_price}c "
+                f">= ask {ask_price}c after all adjustments. Skipping update to "
+                f"avoid self-matching."
+            )
+            return
+
         # Create order levels
         order_levels = self._create_order_levels(
             bid_price, ask_price, pricing.optimal_spread
@@ -1010,10 +1268,25 @@ class AvellanedaMarketMaker:
             if level_idx > 0 and level_idx % 5 == 0:
                 self._write_heartbeat()
 
-            # All levels get the same eta-adjusted amount (A-S model: flat sizing,
-            # inventory rebalancing handled by eta, risk by spread widening per level)
-            bid_amt = bid_amount
-            ask_amt = ask_amount
+            # Per-leg base sizing. With order_dollar_amount unset this is just
+            # the configured share count (flat across levels). With it set, the
+            # base is rescaled to each level's PRICE so each placed order has
+            # the configured dollar notional on the order book (price * amount).
+            #
+            # Both legs use the leg price directly. For ASKs at extreme priors
+            # this produces small share counts that may fail the protocol's
+            # split-mint min-notional check on the low leg (split_price *
+            # amount < 100 cent-shares); those orders are skipped at the place
+            # call site rather than inflating amount to clear min, which would
+            # otherwise blow notional far past the user's $X target.
+            bid_base = _compute_base_amount(context.config, level_bid)
+            ask_base = _compute_base_amount(context.config, level_ask)
+            bid_amt = self._apply_eta_transformation(
+                bid_base, pricing.inventory_skew, is_buy=True
+            )
+            ask_amt = self._apply_eta_transformation(
+                ask_base, pricing.inventory_skew, is_buy=False
+            )
 
             # Track order pair for hanging orders (first level only)
             buy_order_info = None
@@ -1056,6 +1329,138 @@ class AvellanedaMarketMaker:
                     tracker.add_order_pair(buy_order_info, sell_order_info)
 
         context.last_order_refresh = time.time()
+
+    def _place_ask(
+        self,
+        context: MarketContext,
+        outcome: bool,
+        new_price: int,
+        amount: int,
+    ) -> tuple[Optional[str], bool]:
+        """
+        Place an ASK either from existing held inventory or via split-mint.
+
+        Returns (tx_hash, is_inventory_backed). On a clean min-notional skip
+        returns (None, False) and the caller is expected to abort that order.
+
+        Inventory path (preferred): when paired YES+NO inventory is on hand
+        and the visible (price, amount) clears the protocol's per-order
+        min-notional, place a single-leg place_sell_order at the actual
+        quote price and reserve the consumed shares so subsequent levels in
+        the same cycle don't double-book them.
+
+        Split-mint fallback: same two-leg path the bot has always used,
+        used when inventory is exhausted (or pre-mint is disabled). The
+        skip-on-low-leg semantics from the original code are preserved.
+        """
+        inv = self._inventory.get_market_inventory(context.query_id)
+        available = inv.available_for_sell(outcome)
+
+        if available >= amount and _meets_min_notional(new_price, amount):
+            try:
+                tx_hash = self._client.place_sell_order(
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    price=new_price,
+                    amount=amount,
+                    wait=True,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Inventory-backed sell failed (qid={context.query_id} "
+                    f"outcome={'YES' if outcome else 'NO'} {new_price}c x{amount}): {e}"
+                )
+                raise
+            inv.reserve_pair(outcome, amount)
+            logger.debug(
+                f"Inventory-backed ask qid={context.query_id} "
+                f"outcome={'YES' if outcome else 'NO'} {new_price}c x{amount} "
+                f"(avail before/after: {available}/{available - amount})"
+            )
+            return tx_hash, True
+
+        # Fallback to split-mint
+        split_price = new_price if outcome else (100 - new_price)
+        if not _meets_min_notional(split_price, amount):
+            logger.info(
+                f"Market {context.query_id} ask "
+                f"outcome={'YES' if outcome else 'NO'}: skip split-mint "
+                f"(low leg {split_price}c x {amount} = "
+                f"{split_price * amount} < min {MIN_ORDER_NOTIONAL_CENT_SHARES}). "
+                f"Available inventory={available}, needed={amount}."
+            )
+            return None, False
+
+        self._client.place_split_limit_order(
+            query_id=context.query_id,
+            true_price=split_price,
+            amount=amount,
+            wait=True,
+        )
+        try:
+            tx_hash = self._client.place_sell_order(
+                query_id=context.query_id,
+                outcome=True,
+                price=split_price,
+                amount=amount,
+                wait=True,
+            )
+        except Exception as sell_err:
+            logger.error(f"place_sell_order failed after split mint: {sell_err}")
+            try:
+                self._client.cancel_order(
+                    query_id=context.query_id,
+                    outcome=False,
+                    price=100 - split_price,
+                    wait=True,
+                )
+                logger.info("Cancelled orphaned split order after sell failure")
+            except Exception:
+                logger.error("Failed to cancel orphaned split order")
+            raise sell_err
+        return tx_hash, False
+
+    def _cancel_ask(
+        self,
+        context: MarketContext,
+        outcome: bool,
+        price: int,
+        amount: int,
+        is_inventory_backed: bool,
+    ) -> None:
+        """
+        Cancel an ASK previously placed by the bot. The split-mint path
+        listed orders on BOTH sides of the book (at split_price and
+        100-split_price), so we must cancel both. The inventory path
+        listed only the single side at the quote price.
+
+        Releases the inventory reservation either way (the legacy split-mint
+        path never reserved, so release is a no-op there).
+        """
+        inv = self._inventory.get_market_inventory(context.query_id)
+        if is_inventory_backed:
+            try:
+                self._client.cancel_order(
+                    query_id=context.query_id,
+                    outcome=outcome,
+                    price=price,
+                    wait=False,
+                )
+            except Exception:
+                pass  # may already be filled/cancelled
+            inv.release_pair(outcome, amount)
+        else:
+            split_price = price if outcome else (100 - price)
+            for cancel_out, cancel_p in [(False, 100 - split_price), (True, split_price)]:
+                try:
+                    self._client.cancel_order(
+                        query_id=context.query_id,
+                        outcome=cancel_out,
+                        price=cancel_p,
+                        wait=False,
+                    )
+                except Exception:
+                    pass
 
     def _update_single_order(
         self,
@@ -1132,6 +1537,21 @@ class AvellanedaMarketMaker:
                 new_sdk_price = convert_price_for_order(new_price, side)
 
                 if side == Side.BID:
+                    # change_bid has the same silent-failure mode as
+                    # place_buy_order: if new_price * amount falls below the
+                    # protocol minimum, the SDK returns a tx_hash but the
+                    # on-chain action reverts. Pre-check; if below min, leave
+                    # the old order alone (don't attempt update) and let the
+                    # next refresh cycle decide.
+                    if not _meets_min_notional(new_price, amount):
+                        logger.info(
+                            f"Market {context.query_id} {side.value} L{level_idx} "
+                            f"outcome={'YES' if outcome else 'NO'}: skip change_bid "
+                            f"(notional {new_price}c x {amount} = "
+                            f"{new_price * amount} < min {MIN_ORDER_NOTIONAL_CENT_SHARES}). "
+                            f"Keeping old bid @{current_order.price}c on book."
+                        )
+                        return None
                     tx_hash = self._client.change_bid(
                         query_id=context.query_id,
                         outcome=outcome,
@@ -1141,62 +1561,68 @@ class AvellanedaMarketMaker:
                         wait=True,
                     )
                 else:
-                    # Cancel old asks on both sides, then re-mint and re-place.
-                    old_split_price = current_order.price if outcome else (100 - current_order.price)
-                    # Cancel NO-side ask
-                    try:
-                        self._client.cancel_order(
-                            query_id=context.query_id,
-                            outcome=False,
-                            price=100 - old_split_price,
-                            wait=True,
-                        )
-                    except Exception:
-                        pass  # May already be filled/cancelled
-                    # Cancel YES-side ask
-                    try:
-                        self._client.cancel_order(
-                            query_id=context.query_id,
-                            outcome=True,
-                            price=old_split_price,
-                            wait=True,
-                        )
-                    except Exception:
-                        pass  # May already be filled/cancelled
-                    # Mint new pairs and place asks on both sides
-                    split_price = new_price if outcome else (100 - new_price)
-                    self._client.place_split_limit_order(
-                        query_id=context.query_id,
-                        true_price=split_price,
-                        amount=amount,
-                        wait=True,
+                    # Pre-check: can either the inventory or split-mint path
+                    # place this ask at all? If not, leave the old ask on the
+                    # book (still strictly better than an empty level until
+                    # next refresh).
+                    inv_for_check = self._inventory.get_market_inventory(context.query_id)
+                    avail = inv_for_check.available_for_sell(outcome)
+                    # If the OLD ask was inventory-backed, its amount is
+                    # currently locked in reservations; we'd release it on
+                    # cancel and that capacity would be available to the new
+                    # ask. Account for that here so we don't false-negative.
+                    old_inv_release = (
+                        current_order.amount
+                        if current_order.is_inventory_backed
+                        else 0
                     )
-                    try:
-                        tx_hash = self._client.place_sell_order(
-                            query_id=context.query_id,
-                            outcome=True,
-                            price=split_price,
-                            amount=amount,
-                            wait=True,
+                    will_inv = (
+                        (avail + old_inv_release) >= amount
+                        and _meets_min_notional(new_price, amount)
+                    )
+                    split_price_check = new_price if outcome else (100 - new_price)
+                    will_split = _meets_min_notional(split_price_check, amount)
+                    if not (will_inv or will_split):
+                        logger.info(
+                            f"Market {context.query_id} {side.value} L{level_idx} "
+                            f"outcome={'YES' if outcome else 'NO'}: skip refresh "
+                            f"(neither inv nor split-mint path can place "
+                            f"{new_price}c x{amount}; avail={avail}, "
+                            f"split_low={split_price_check}c). Keeping old."
                         )
-                    except Exception as sell_err:
-                        # Split succeeded but sell failed - try to cancel the
-                        # orphaned NO-side order placed by the split to recover.
-                        logger.error(f"place_sell_order failed after split mint: {sell_err}")
-                        try:
-                            cancel_price = 100 - split_price
-                            self._client.cancel_order(
-                                query_id=context.query_id,
-                                outcome=False,
-                                price=cancel_price,
-                                wait=True,
-                            )
-                            logger.info("Cancelled orphaned split order after sell failure")
-                        except Exception:
-                            logger.error("Failed to cancel orphaned split order")
-                        raise sell_err
+                        return None
 
-                order_mgr.record_order(outcome, side, new_price, amount, tx_hash, level_idx)
+                    # Cancel old (path-aware), then place new (path-decided
+                    # at runtime by _place_ask based on now-current inventory).
+                    self._cancel_ask(
+                        context=context,
+                        outcome=outcome,
+                        price=current_order.price,
+                        amount=current_order.amount,
+                        is_inventory_backed=current_order.is_inventory_backed,
+                    )
+                    tx_hash, is_inv_backed = self._place_ask(
+                        context=context,
+                        outcome=outcome,
+                        new_price=new_price,
+                        amount=amount,
+                    )
+                    if tx_hash is None:
+                        # Pre-check said it would place but actual placement
+                        # was rejected (rare; e.g. inventory shifted between
+                        # check and place due to a fill). Old ask is gone;
+                        # next refresh will retry.
+                        logger.warning(
+                            f"Market {context.query_id} {side.value} L{level_idx}: "
+                            f"refresh placement returned None after old cancel "
+                            f"(level now empty until next cycle)"
+                        )
+                        return None
+
+                order_mgr.record_order(
+                    outcome, side, new_price, amount, tx_hash, level_idx,
+                    is_inventory_backed=(is_inv_backed if side == Side.ASK else False),
+                )
                 self.stats.orders_updated += 1
 
                 # Track P&L
@@ -1217,6 +1643,7 @@ class AvellanedaMarketMaker:
                     amount=amount,
                     order_id=tx_hash,
                     level_idx=level_idx,
+                    is_inventory_backed=(is_inv_backed if side == Side.ASK else False),
                 )
 
                 logger.info(
@@ -1228,7 +1655,16 @@ class AvellanedaMarketMaker:
 
             else:
                 # Place new order
+                is_inv_backed = False
                 if side == Side.BID:
+                    if not _meets_min_notional(new_price, amount):
+                        logger.info(
+                            f"Market {context.query_id} {side.value} L{level_idx} "
+                            f"outcome={'YES' if outcome else 'NO'}: skip place "
+                            f"(notional {new_price}c x {amount} = "
+                            f"{new_price * amount} < min {MIN_ORDER_NOTIONAL_CENT_SHARES})"
+                        )
+                        return None
                     tx_hash = self._client.place_buy_order(
                         query_id=context.query_id,
                         outcome=outcome,
@@ -1237,43 +1673,25 @@ class AvellanedaMarketMaker:
                         wait=True,
                     )
                 else:
-                    # Mint share pairs and place asks on BOTH sides of the book.
-                    # place_split_limit_order mints pairs and sells NO at (100 - true_price).
-                    # We then also sell the YES shares we retained via place_sell_order.
-                    split_price = new_price if outcome else (100 - new_price)
-                    self._client.place_split_limit_order(
-                        query_id=context.query_id,
-                        true_price=split_price,
+                    # Inventory-aware ASK: prefer existing held YES/NO shares
+                    # (single-leg, no new collateral), fall back to split-mint
+                    # only when inventory is exhausted. _place_ask returns
+                    # (None, _) when neither path can satisfy the protocol's
+                    # min-notional, in which case skip this order rather than
+                    # placing something that will silently revert on chain.
+                    tx_hash, is_inv_backed = self._place_ask(
+                        context=context,
+                        outcome=outcome,
+                        new_price=new_price,
                         amount=amount,
-                        wait=True,
                     )
-                    # Place YES sell order with the shares we just minted
-                    try:
-                        tx_hash = self._client.place_sell_order(
-                            query_id=context.query_id,
-                            outcome=True,
-                            price=split_price,
-                            amount=amount,
-                            wait=True,
-                        )
-                    except Exception as sell_err:
-                        # Split succeeded but sell failed - try to cancel the
-                        # orphaned NO-side order placed by the split to recover.
-                        logger.error(f"place_sell_order failed after split mint: {sell_err}")
-                        try:
-                            cancel_price = 100 - split_price
-                            self._client.cancel_order(
-                                query_id=context.query_id,
-                                outcome=False,
-                                price=cancel_price,
-                                wait=True,
-                            )
-                            logger.info("Cancelled orphaned split order after sell failure")
-                        except Exception:
-                            logger.error("Failed to cancel orphaned split order")
-                        raise sell_err
+                    if tx_hash is None:
+                        return None
 
-                order_mgr.record_order(outcome, side, new_price, amount, tx_hash, level_idx)
+                order_mgr.record_order(
+                    outcome, side, new_price, amount, tx_hash, level_idx,
+                    is_inventory_backed=is_inv_backed,
+                )
                 self.stats.orders_placed += 1
 
                 # Track P&L
@@ -1293,11 +1711,13 @@ class AvellanedaMarketMaker:
                     amount=amount,
                     order_id=tx_hash,
                     level_idx=level_idx,
+                    is_inventory_backed=is_inv_backed,
                 )
 
                 logger.info(
                     f"Market {context.query_id} {side.value} L{level_idx}: placed "
                     f"@{new_price}¢ x{amount}"
+                    f"{' (inv-backed)' if is_inv_backed else ''}"
                 )
 
                 return tx_hash
@@ -1349,19 +1769,16 @@ class AvellanedaMarketMaker:
 
                 try:
                     if side == Side.ASK:
-                        # Ask orders exist on both sides (split mint + sell).
-                        # Cancel NO-side ask and YES-side ask.
-                        split_price = order.price if outcome else (100 - order.price)
-                        for cancel_out, cancel_p in [(False, 100 - split_price), (True, split_price)]:
-                            try:
-                                self._client.cancel_order(
-                                    query_id=context.query_id,
-                                    outcome=cancel_out,
-                                    price=cancel_p,
-                                    wait=True,
-                                )
-                            except Exception:
-                                pass  # May already be filled/cancelled
+                        # Branch on the recorded path: inventory-backed asks
+                        # were placed as a single leg at the quote price;
+                        # split-mint asks have two on-chain orders to remove.
+                        self._cancel_ask(
+                            context=context,
+                            outcome=outcome,
+                            price=order.price,
+                            amount=order.amount,
+                            is_inventory_backed=order.is_inventory_backed,
+                        )
                     else:
                         cancel_outcome = outcome
                         cancel_price = convert_price_for_order(order.price, side)
@@ -1577,6 +1994,13 @@ class AvellanedaMarketMaker:
                 continue
 
             try:
+                if not _meets_min_notional(order.price, order.amount):
+                    logger.info(
+                        f"Skipping hanging order recreate (price {order.price}c "
+                        f"x amount {order.amount} below min "
+                        f"{MIN_ORDER_NOTIONAL_CENT_SHARES})"
+                    )
+                    continue
                 if order.is_buy:
                     tx_hash = self._client.place_buy_order(
                         query_id=context.query_id,
@@ -1625,6 +2049,12 @@ class AvellanedaMarketMaker:
                 continue
 
             try:
+                if not _meets_min_notional(price, amount):
+                    logger.info(
+                        f"Skipping override {side_str} @{price}c x{amount} "
+                        f"(below min notional {MIN_ORDER_NOTIONAL_CENT_SHARES})"
+                    )
+                    continue
                 if side_str == "buy":
                     tx_hash = self._client.place_buy_order(
                         query_id=context.query_id,
@@ -1761,21 +2191,16 @@ class AvellanedaMarketMaker:
                 for side, lvl_idx, order in all_orders:
                     try:
                         if side == Side.ASK:
-                            # Ask orders exist on both sides (split mint + sell).
-                            # Cancel NO-side and YES-side legs. Best-effort:
-                            # an inner-leg failure is swallowed because the
-                            # other leg may still need to be cancelled.
-                            split_price = order.price if outcome else (100 - order.price)
-                            for cancel_out, cancel_p in [(False, 100 - split_price), (True, split_price)]:
-                                try:
-                                    self._client.cancel_order(
-                                        query_id=context.query_id,
-                                        outcome=cancel_out,
-                                        price=cancel_p,
-                                        wait=False,
-                                    )
-                                except Exception:
-                                    pass  # may already be filled/cancelled
+                            # Inventory-backed asks are single-leg; split-mint
+                            # asks live on both sides of the book. Branch via
+                            # the recorded flag on the BotOrder.
+                            self._cancel_ask(
+                                context=context,
+                                outcome=outcome,
+                                price=order.price,
+                                amount=order.amount,
+                                is_inventory_backed=order.is_inventory_backed,
+                            )
                         else:
                             cancel_outcome = outcome
                             cancel_price = convert_price_for_order(order.price, side)
@@ -1847,6 +2272,13 @@ class AvellanedaMarketMaker:
 
             # Initial inventory refresh
             self._refresh_inventory()
+
+            # Pre-mint pair inventory per market so subsequent ASKs can be
+            # backed by held shares (place_sell_order) instead of minting
+            # new pairs every cycle. Idempotent: a restart with sufficient
+            # inventory will compute zero deficit and no-op. Skipped in
+            # dry_run / read_only modes.
+            self._pre_mint_all_markets()
 
             # Run main loop
             self._running = True

@@ -27,6 +27,10 @@ class TrackedOrder:
     created_at: float  # Unix timestamp
     order_id: Optional[str] = None  # SDK order ID if available
     level_idx: int = 0  # Order level index (0 = tightest spread)
+    # True iff a sell was placed via place_sell_order against existing
+    # inventory (single-leg, single cancel). False covers buys and the
+    # legacy split-mint sell path (two on-chain legs, two cancels).
+    is_inventory_backed: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -36,6 +40,11 @@ class TrackedOrder:
         # Backwards compat: old state files may not have level_idx
         if "level_idx" not in data:
             data["level_idx"] = 0
+        # Old state files predate the inventory-backed flag; default False
+        # treats them as legacy split-mint asks (safe — cancel-with-pass on
+        # the missing leg is already handled).
+        if "is_inventory_backed" not in data:
+            data["is_inventory_backed"] = False
         return cls(**data)
 
     @property
@@ -115,6 +124,7 @@ class OrderStateManager:
         amount: int,
         order_id: Optional[str] = None,
         level_idx: int = 0,
+        is_inventory_backed: bool = False,
     ) -> TrackedOrder:
         """
         Track a new order placed by the bot.
@@ -140,6 +150,7 @@ class OrderStateManager:
             created_at=time.time(),
             order_id=order_id,
             level_idx=level_idx,
+            is_inventory_backed=is_inventory_backed,
         )
 
         self._orders[order.key] = order
@@ -158,6 +169,7 @@ class OrderStateManager:
         amount: int,
         order_id: Optional[str] = None,
         level_idx: int = 0,
+        is_inventory_backed: bool = False,
     ) -> TrackedOrder:
         """
         Update a tracked order (price change).
@@ -181,7 +193,10 @@ class OrderStateManager:
             del self._orders[old_key]
 
         # Add new order
-        return self.track_order(query_id, outcome, is_buy, new_price, amount, order_id, level_idx)
+        return self.track_order(
+            query_id, outcome, is_buy, new_price, amount, order_id, level_idx,
+            is_inventory_backed=is_inventory_backed,
+        )
 
     def untrack_order(
         self,

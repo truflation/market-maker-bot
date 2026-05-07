@@ -33,6 +33,49 @@ class MarketInventory:
     usd_locked_yes_bids: Decimal = field(default_factory=lambda: Decimal("0"))
     usd_locked_no_bids: Decimal = field(default_factory=lambda: Decimal("0"))
 
+    # Inventory-backed sells reserved against currently-listed asks. Each
+    # reserved unit consumes one matched (YES, NO) pair regardless of which
+    # outcome the ask is on, because backing a YES ask burns 1 YES from
+    # inventory and backing a NO ask burns 1 NO. We track YES and NO
+    # reservations separately so the available pool can shrink correctly
+    # when asks on different outcomes are listed against the same pair pool.
+    reserved_yes_sells: int = 0
+    reserved_no_sells: int = 0
+
+    def reserve_pair(self, outcome: bool, n: int) -> None:
+        """Reserve n shares for an inventory-backed ASK. outcome=True debits
+        from YES side, outcome=False from NO side. No-op if n <= 0."""
+        if n <= 0:
+            return
+        if outcome:
+            self.reserved_yes_sells += n
+        else:
+            self.reserved_no_sells += n
+
+    def release_pair(self, outcome: bool, n: int) -> None:
+        """Return n reserved shares to available (cancel or fill). Clamped at
+        zero so a stray double-release does not break the invariant."""
+        if n <= 0:
+            return
+        if outcome:
+            self.reserved_yes_sells = max(0, self.reserved_yes_sells - n)
+        else:
+            self.reserved_no_sells = max(0, self.reserved_no_sells - n)
+
+    def available_for_sell(self, outcome: bool) -> int:
+        """Shares available to back a new inventory-backed ASK on this side.
+        Negative results are clamped to 0 so an inventory drift (e.g. from a
+        partial fill between refresh cycles) does not produce nonsense."""
+        held = self.yes_shares if outcome else self.no_shares
+        reserved = self.reserved_yes_sells if outcome else self.reserved_no_sells
+        return max(0, held - reserved)
+
+    def paired_inventory(self) -> int:
+        """Number of fully-paired (1 YES + 1 NO) units we hold. Pre-mint
+        deficit math runs against this since unpaired imbalance from prior
+        fills can't be relied on to back ask pairs the bot wants to write."""
+        return min(self.yes_shares, self.no_shares)
+
     def update_from_positions(
         self,
         yes_shares: int,

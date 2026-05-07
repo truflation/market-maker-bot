@@ -117,6 +117,20 @@ class MarketConfig:
     name: str = ""
     outcome_mode: OutcomeMode = OutcomeMode.YES_ONLY
     order_amount: int = 100  # Default order size in shares
+    # When set, per-order amount is sized dynamically so each individual
+    # SDK order targets this dollar notional. amount = round(X * 100 / price).
+    # Useful for thin prediction markets where a fixed share count produces
+    # very uneven dollar notionals across prices ($0.10 at 1c vs $9.90 at
+    # 99c with order_amount=10). Per-leg, so each placed order is approx
+    # the same size; split-mint auto-listed legs may differ.
+    order_dollar_amount: Optional[float] = None
+    # When set to a positive int, on bot startup the market is brought up to
+    # at least this many (YES,NO) pairs of inventory via a one-time pre-mint
+    # split-mint order, after which ASK placements draw down from existing
+    # inventory via place_sell_order rather than minting new pairs each time.
+    # None or 0 disables pre-mint and preserves the legacy split-mint-every-
+    # ask behavior. Idempotent across restarts (deficit only).
+    initial_mint_pairs: Optional[int] = None
     enabled: bool = True
 
     # Market-specific overrides (use global if None)
@@ -127,6 +141,16 @@ class MarketConfig:
     lower_bound: Optional[float] = None
     upper_bound: Optional[float] = None
     settle_time: Optional[int] = None
+    # Per-outcome prior probability for YES, in [0.0, 1.0]. When set, the
+    # bot uses this directly as fair YES (× 100 cents) instead of running
+    # Black-Scholes on the underlying stream. Used for Hormuz markets where
+    # the stream has too little history (and a degenerate spot=0 most days)
+    # for B-S to produce a useful prior.
+    #
+    # Under pricing_source="black_scholes" (mainnet) this prior is the
+    # permanent fair-value source; only pricing_source="order_book" falls
+    # back to order-book mid once liquidity accumulates.
+    initial_probability: Optional[float] = None
 
     def __post_init__(self):
         if not self.name:
@@ -154,10 +178,17 @@ class AvellanedaConfig:
     # Formula: size * exp(-eta * q) where q is inventory deviation
     order_amount_shape_factor: float = 0.5
 
-    # Minimum spread as percentage of mid price
-    # For binary options: 0 means no minimum, 2.0 means 2% of mid price
-    # At mid=50 cents, 2% = 1 cent minimum spread
+    # Minimum spread as percentage of mid price (legacy, fine for testnet
+    # markets where mid is roughly 50¢). For binary options: 0 means no
+    # minimum, 2.0 means 2% of mid price. At mid=50¢, 2% = 1¢ min spread.
     min_spread: float = 0.0
+
+    # Absolute minimum total spread in cents. When > 0, takes precedence
+    # over min_spread (the percentage form above). Use this for prediction
+    # markets with fixed-prior pricing or thin order books, where we want
+    # a hard cents floor regardless of mid price level.
+    # Example: min_spread_cents=6 forces bid <= mid-3 and ask >= mid+3.
+    min_spread_cents: float = 0.0
 
     # Order refresh time in seconds
     # How often to re-evaluate and update orders
@@ -277,6 +308,32 @@ class AvellanedaConfig:
     # 1.0 = infinite timeframe (recommended for 24/7 markets)
     time_horizon: float = 1.0
 
+    # === Pre-mint inventory ===
+    # See MarketConfig.initial_mint_pairs. The cushion multiplier is what the
+    # orchestrator uses when deriving per-market initial_mint_pairs from the
+    # planned book size: target_pairs = ceil(asks_per_market * order_dollar
+    # _amount * mint_cushion_multiplier). Lives here (vs MarketConfig) so the
+    # multiplier is a single deployment-wide knob.
+    mint_cushion_multiplier: float = 1.0
+    # Price at which the auto-listed YES leg of the bootstrap split-mint sits
+    # before being cancelled. 99c is the safest "park" price because no fair-
+    # value strategy will buy YES at 99c on a sub-1.00 prior, so accidental
+    # fills before the cancel land are nearly impossible.
+    pre_mint_listing_price_yes_cents: int = 99
+
+    def __post_init__(self):
+        """Catch silently-contradictory config values that would otherwise
+        cause the spread floor to be violated. If min_spread_cents exceeds
+        max_spread, the calculate_prices path enforces the floor first and
+        the max_spread cap second, silently squeezing back below the floor.
+        Better to fail loudly at config-load time."""
+        if self.min_spread_cents > 0 and self.min_spread_cents > self.max_spread:
+            raise ValueError(
+                f"min_spread_cents ({self.min_spread_cents}) > "
+                f"max_spread ({self.max_spread}); the cents floor would be "
+                f"silently violated by the max-spread cap downstream."
+            )
+
 
 @dataclass
 class BotConfig:
@@ -303,11 +360,21 @@ class BotConfig:
     pricing_source: str = "black_scholes"
 
     # Operational settings
-    dry_run: bool = False  # If True, log but don't execute orders
+    dry_run: bool = False  # If True, skip TNClient init entirely; useful only for local-import testing
+    # If True, the bot DOES connect to TN and reads pass through, but any write
+    # (place/cancel/settle) is logged and short-circuited. Distinct from
+    # dry_run because dry_run leaves the client uninitialized so even reads
+    # fail; read_only lets you do a real Phase-1 dry-run on chain.
+    read_only: bool = False
     debug: bool = False  # Enable verbose logging
     cancel_open_orders_on_exit: bool = True  # Cancel all open orders when bot shuts down
     order_state_file: str = "bot_order_state.json"  # File to persist order state for restart recovery
     pre_settlement_cutoff: float = 900.0  # Seconds before settle_time to pull all liquidity (default 15 min)
+    # Hard cap on total USDC committed to pre-mint across all markets. If the
+    # sum of per-market deficits would exceed this, the bot logs and aborts
+    # startup before broadcasting any split-mint. None disables the cap.
+    # Sized in dollars (each pair = $1). Recommended on mainnet; off on testnet.
+    pre_mint_max_total_collateral_usd: Optional[float] = None
 
 
 def load_config_from_dict(data: dict) -> BotConfig:
@@ -335,8 +402,10 @@ def load_config_from_dict(data: dict) -> BotConfig:
         inventory_refresh_interval=data.get("inventory_refresh_interval", 30.0),
         pricing_source=data.get("pricing_source", "black_scholes"),
         dry_run=data.get("dry_run", False),
+        read_only=data.get("read_only", False),
         debug=data.get("debug", False),
         cancel_open_orders_on_exit=data.get("cancel_open_orders_on_exit", True),
         order_state_file=data.get("order_state_file", "bot_order_state.json"),
         pre_settlement_cutoff=data.get("pre_settlement_cutoff", 900.0),
+        pre_mint_max_total_collateral_usd=data.get("pre_mint_max_total_collateral_usd"),
     )
