@@ -269,6 +269,7 @@ class OrderManager:
         amount: int,
         tx_hash: str,
         level_idx: int = 0,
+        is_inventory_backed: bool = False,
     ) -> BotOrder:
         """
         Record a placed order.
@@ -280,6 +281,9 @@ class OrderManager:
             amount: Order amount
             tx_hash: Transaction hash
             level_idx: Order level index
+            is_inventory_backed: True iff sell was placed against held shares
+                via place_sell_order (single leg). False for split-mint sells
+                and all bids.
 
         Returns:
             Created BotOrder
@@ -292,6 +296,7 @@ class OrderManager:
             amount=amount,
             tx_hash=tx_hash,
             created_at=time.time(),
+            is_inventory_backed=is_inventory_backed,
         )
 
         orders = self.context.get_orders(outcome)
