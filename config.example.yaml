@@ -35,6 +35,11 @@ markets:
     # Market-specific overrides (optional)
     # gamma: 0.15
     # min_spread: 3.0
+    # Pre-mint inventory (optional, disabled by default).
+    # See the "Pre-mint Inventory" section below for the full opt-in.
+    # Set to the YES+NO pair target you want held at startup; each pair
+    # costs $1 collateral. Leave unset to mint lazily per ASK cycle.
+    # initial_mint_pairs: 36
 
   # Example: Market making on US CPI Index
   # - query_id: 2
@@ -62,6 +67,46 @@ markets:
   #   outcome_mode: "both"
   #   order_amount: 100
   #   enabled: true
+
+# =============================================================================
+# Pre-mint Inventory (OPTIONAL, disabled by default)
+# =============================================================================
+# By default the bot mints YES+NO pairs lazily, one split-mint per ASK cycle.
+# This works for any volume but pays gas for every fresh mint.
+#
+# As an alternative, you can pre-fund pair inventory at startup so subsequent
+# ASKs are backed by held shares (place_sell_order against inventory) instead
+# of minting new pairs every cycle. This is opt-in and disabled out of the box.
+#
+# To enable, you must:
+#   1. Set `initial_mint_pairs: <N>` per market under `markets:` above (the
+#      per-market YES+NO pair target; each pair = $1 collateral).
+#   2. Set `pre_mint_max_total_collateral_usd:` below as a hard wallet cap.
+#      Pre-mint aborts startup if the summed deficit would exceed this.
+#
+# The bot computes deficit = target - paired_inventory() per market and only
+# mints what is missing, so restarts with sufficient inventory are no-ops.
+# Markets within `pre_settlement_cutoff + 300s` of settling are skipped.
+# Pre-mint is also skipped in `dry_run` and `read_only` modes.
+#
+# Leaving `initial_mint_pairs` unset on every market keeps pre-mint disabled.
+
+# Hard wallet cap on the summed pre-mint collateral across all markets.
+# Required if you set `initial_mint_pairs` on any market. Sized in dollars
+# (each pair = $1). None disables the cap entirely (NOT recommended on
+# mainnet).
+# pre_mint_max_total_collateral_usd: 1500
+
+# Multiplier applied when sizing per-market `initial_mint_pairs` from your
+# planned book (target_pairs = ceil(asks_per_market * order_amount * cushion)).
+# 1.0 = mint exactly what you plan to ASK; >1.0 = oversize for refill headroom.
+# mint_cushion_multiplier: 1.0
+
+# `true_price` passed to place_split_limit_order during pre-mint. The SDK
+# auto-lists the NO leg at `100 - true_price`, so true_price=1 parks the
+# auto-listed NO at 99c (unreachable) and prevents any race between mint
+# and cancel from leaking shares.
+# pre_mint_listing_price_yes_cents: 1
 
 # Avellaneda-Stoikov strategy parameters
 avellaneda:
