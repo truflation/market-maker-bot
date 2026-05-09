@@ -104,8 +104,11 @@ markets:
 
 # `true_price` passed to place_split_limit_order during pre-mint. The SDK
 # auto-lists the NO leg at `100 - true_price`, so true_price=1 parks the
-# auto-listed NO at 99c (unreachable) and prevents any race between mint
-# and cancel from leaking shares.
+# auto-listed NO at 99c. A 99c NO ask is significantly less likely to fill
+# than a same-sized leg listed at the bot's intended price, which reduces
+# the chance of share leaks if the mint lands and the follow-up cancel
+# fails or arrives late. It is not an absolute guarantee: a counterparty
+# willing to pay 99c (or a market dislocation) can still take the leg.
 # pre_mint_listing_price_yes_cents: 1
 
 # Avellaneda-Stoikov strategy parameters

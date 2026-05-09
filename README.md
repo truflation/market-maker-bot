@@ -280,7 +280,9 @@ pre_mint_max_total_collateral_usd: 1500
 mint_cushion_multiplier: 1.0
 
 # Optional. true_price passed to split-mint; NO leg auto-lists at 100 - this.
-# Default 1 parks the auto-listed NO at 99c (unreachable), preventing race leaks.
+# Default 1 parks the auto-listed NO at 99c, which significantly reduces the
+# chance of the leg filling if the follow-up cancel fails or arrives late.
+# Not an absolute guarantee: a counterparty willing to pay 99c can still take it.
 pre_mint_listing_price_yes_cents: 1
 ```
 
