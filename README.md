@@ -237,6 +237,7 @@ markets:
 - `enabled`: Set to `false` to disable a market (default: `true`)
 - `gamma`: Optional market-specific risk factor override
 - `min_spread`: Optional market-specific minimum spread override
+- `initial_mint_pairs`: Optional. If set, enables pre-mint at startup for this market (YES+NO pair target). See "Pre-mint Inventory" below. Default: not set, pre-mint disabled.
 
 ### Order State Persistence
 
@@ -250,6 +251,50 @@ Configure with:
 order_state_file: "bot_order_state.json"
 cancel_open_orders_on_exit: true  # Set to false to leave orders open on shutdown
 ```
+
+### Pre-mint Inventory (Optional, Disabled by Default)
+
+By default the bot mints YES+NO pairs lazily: each ASK cycle does its own split-mint and lists one leg, paying gas every cycle. As an alternative you can pre-fund pair inventory at startup so subsequent ASKs are backed by held shares (`place_sell_order` against inventory) instead of minting new pairs every cycle.
+
+This feature is opt-in and disabled out of the box. The user decides whether to enable it and how much to mint per market. Leaving the relevant fields unset keeps the bot in lazy-mint mode.
+
+**To enable:**
+
+1. Set `initial_mint_pairs: <N>` on each market you want pre-funded (each pair costs $1 collateral).
+2. Set `pre_mint_max_total_collateral_usd:` at the top level as a hard wallet cap. Pre-mint aborts startup if the summed deficit across markets would exceed this.
+
+```yaml
+markets:
+  - query_id: 1
+    stream_id: "..."
+    name: "..."
+    outcome_mode: "both"
+    order_amount: 100
+    enabled: true
+    initial_mint_pairs: 36   # opt in, sized to your planned book
+
+# Required when any market sets initial_mint_pairs. Hard $ cap.
+pre_mint_max_total_collateral_usd: 1500
+
+# Optional. Multiplier when sizing initial_mint_pairs from planned book.
+mint_cushion_multiplier: 1.0
+
+# Optional. true_price passed to split-mint; NO leg auto-lists at 100 - this.
+# Default 1 parks the auto-listed NO at 99c, which significantly reduces the
+# chance of the leg filling if the follow-up cancel fails or arrives late.
+# Not an absolute guarantee: a counterparty willing to pay 99c can still take it.
+pre_mint_listing_price_yes_cents: 1
+```
+
+**Behavior:**
+
+- The bot computes deficit per market = `target - paired_inventory()` and only mints the difference. Restarts with sufficient inventory are no-ops.
+- Markets within `pre_settlement_cutoff + 300s` of settling are skipped (no point minting into a market about to liquidate).
+- The cap is checked before any broadcast: if total deficit would exceed `pre_mint_max_total_collateral_usd`, the bot aborts with a clear log line.
+- Pre-mint is also skipped in `dry_run` and `read_only` modes.
+- It is the operator's responsibility to size `initial_mint_pairs` and the cap appropriately for their wallet and book.
+
+**Leaving `initial_mint_pairs` unset on every market keeps pre-mint disabled.** This is the default and safe out of the box.
 
 ## References
 
