@@ -761,9 +761,8 @@ class AvellanedaMarketMaker:
         then-place silent-failure race in `change_bid` / `_cancel_ask`
         update paths, where the cancel succeeds, the replacement
         silently fails, and the on-chain order persists until the
-        bot restarts. Without this pass, the rate sits at ~370/hr
-        on testnet-EPS sustained smoke (similar on degraded mainnet
-        gateway pre-MicBun snapshot fix).
+        bot restarts. Without this pass the orphan rate grows
+        unboundedly on a degraded gateway.
 
         Wallet-scoped: the on-chain order book entries are filtered to
         the bot's own wallet address. If the address cannot be derived
@@ -800,9 +799,9 @@ class AvellanedaMarketMaker:
 
         # Per-pass cap on cancel calls to avoid a nonce-storm on a
         # backlog of accumulated orphans (e.g. first pass after enabling
-        # the flag on a long-running bot like Hormuz mainnet). Excess
-        # orphans are deferred to subsequent passes; reconcile is
-        # idempotent so the next pass will pick them up.
+        # the flag on a long-running bot). Excess orphans are deferred
+        # to subsequent passes; reconcile is idempotent so the next pass
+        # will pick them up.
         MAX_CANCELS_PER_PASS = 20
         total_orphans = 0
         total_stale = 0
