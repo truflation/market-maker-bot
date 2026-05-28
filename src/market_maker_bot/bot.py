@@ -207,6 +207,7 @@ class AvellanedaMarketMaker:
 
         # Timing
         self._last_inventory_refresh = 0.0
+        self._last_reconcile = 0.0
 
         # Execution state (timeframe control)
         self._execution_state = self._create_execution_state()
@@ -751,6 +752,167 @@ class AvellanedaMarketMaker:
                 f"Failed to calculate initial price for market {market_config.query_id}: {e}"
             )
             return None
+
+    def _periodic_reconcile_against_chain(self) -> None:
+        """In-loop reconcile: untracks local state with no chain
+        counterpart AND cancels chain orders the bot does not track.
+
+        The orphan-cancel direction is the fix for the known cancel-
+        then-place silent-failure race in `change_bid` / `_cancel_ask`
+        update paths, where the cancel succeeds, the replacement
+        silently fails, and the on-chain order persists until the
+        bot restarts. Without this pass, the rate sits at ~370/hr
+        on testnet-EPS sustained smoke (similar on degraded mainnet
+        gateway pre-MicBun snapshot fix).
+
+        Wallet-scoped: the on-chain order book entries are filtered to
+        the bot's own wallet address. If the address cannot be derived
+        from the configured private key, the reconcile aborts rather
+        than risk cancelling other participants' orders.
+
+        False-positive risk on freshly-placed orders: all placements use
+        `wait=True` and `track_order` runs on the same thread before the
+        next cycle, so by the time periodic reconcile runs every order
+        placed in the cycle is both on chain and in local state.
+
+        Skipped in dry_run.
+        """
+        if self.config.dry_run:
+            return
+
+        wallet_addr: Optional[str] = None
+        try:
+            key = self.config.private_key.strip()
+            if key.startswith("0x"):
+                key = key[2:]
+            if len(key) != 64:
+                raise ValueError("private_key must be 64 hex chars")
+            from eth_account import Account
+            wallet_addr = Account.from_key("0x" + key).address.lower()
+        except Exception:
+            wallet_addr = None
+        if wallet_addr is None:
+            logger.warning(
+                "Periodic reconcile: could not derive wallet address; "
+                "aborting rather than cancelling other participants' orders"
+            )
+            return
+
+        # Per-pass cap on cancel calls to avoid a nonce-storm on a
+        # backlog of accumulated orphans (e.g. first pass after enabling
+        # the flag on a long-running bot like Hormuz mainnet). Excess
+        # orphans are deferred to subsequent passes; reconcile is
+        # idempotent so the next pass will pick them up.
+        MAX_CANCELS_PER_PASS = 20
+        total_orphans = 0
+        total_stale = 0
+        for query_id, context in self._markets.items():
+            bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
+            asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
+
+            for outcome in (True, False):
+                try:
+                    entries = self._client.get_order_book(query_id, outcome)
+                except Exception as exc:
+                    logger.warning(
+                        f"Periodic reconcile: get_order_book("
+                        f"{query_id}, {outcome}) failed: {exc}"
+                    )
+                    continue
+                for entry in entries:
+                    owner = entry.get("wallet_address")
+                    if owner is None:
+                        continue
+                    if isinstance(owner, (bytes, bytearray)):
+                        owner_hex = "0x" + owner.hex()
+                    else:
+                        owner_hex = str(owner)
+                    if owner_hex.lower() != wallet_addr:
+                        continue
+                    raw_price = entry.get("price")
+                    amount = entry.get("amount", 0)
+                    if raw_price is None:
+                        continue
+                    if raw_price < 0:
+                        bids[outcome][abs(raw_price)] = (
+                            bids[outcome].get(abs(raw_price), 0) + amount
+                        )
+                    elif raw_price > 0:
+                        asks[outcome][raw_price] = (
+                            asks[outcome].get(raw_price, 0) + amount
+                        )
+
+            # Build the set of (outcome, is_buy, price) the bot
+            # considers its own. Untrack stale local entries.
+            tracked_keys: set[tuple[bool, bool, int]] = set()
+            tracked_orders = self._order_state.get_market_orders(query_id)
+            stale = 0
+            for tracked in tracked_orders:
+                if tracked.is_buy:
+                    is_active = tracked.price in bids[tracked.outcome]
+                else:
+                    is_active = tracked.price in asks[tracked.outcome]
+
+                if is_active:
+                    tracked_keys.add((tracked.outcome, tracked.is_buy, tracked.price))
+                else:
+                    stale += 1
+                    self._order_state.untrack_order(
+                        query_id, tracked.outcome, tracked.is_buy,
+                        tracked.price, tracked.level_idx,
+                    )
+
+            # Orphan pass: anything in bids/asks for this wallet that is
+            # not in tracked_keys is an orphan. Cancel it. Respect the
+            # per-pass cap to avoid a nonce-storm.
+            orphan_cancels = 0
+            for outcome in (True, False):
+                if total_orphans + orphan_cancels >= MAX_CANCELS_PER_PASS:
+                    break
+                for price in bids[outcome]:
+                    if total_orphans + orphan_cancels >= MAX_CANCELS_PER_PASS:
+                        break
+                    if (outcome, True, price) in tracked_keys:
+                        continue
+                    try:
+                        self._client.cancel_order(
+                            query_id=query_id, outcome=outcome,
+                            price=-price, wait=False,
+                        )
+                        orphan_cancels += 1
+                    except Exception as exc:
+                        logger.warning(
+                            f"Periodic reconcile: failed to cancel orphan "
+                            f"bid qid={query_id} {'YES' if outcome else 'NO'} "
+                            f"{price}c: {exc}"
+                        )
+                for price in asks[outcome]:
+                    if total_orphans + orphan_cancels >= MAX_CANCELS_PER_PASS:
+                        break
+                    if (outcome, False, price) in tracked_keys:
+                        continue
+                    try:
+                        self._client.cancel_order(
+                            query_id=query_id, outcome=outcome,
+                            price=price, wait=False,
+                        )
+                        orphan_cancels += 1
+                    except Exception as exc:
+                        logger.warning(
+                            f"Periodic reconcile: failed to cancel orphan "
+                            f"ask qid={query_id} {'YES' if outcome else 'NO'} "
+                            f"{price}c: {exc}"
+                        )
+
+            total_orphans += orphan_cancels
+            total_stale += stale
+
+        logger.info(
+            f"Periodic reconcile pass: "
+            f"{total_orphans} on-chain orphans cancelled, "
+            f"{total_stale} stale local entries untracked across "
+            f"{len(self._markets)} markets"
+        )
 
     def _pre_mint_all_markets(self) -> None:
         """
@@ -2243,6 +2405,23 @@ class AvellanedaMarketMaker:
 
             self.stats.cycles += 1
             self._write_heartbeat()
+
+            # Periodic on-chain orphan reconcile. Opt-in via
+            # `config.reconcile_interval > 0`. Cancels chain orders the
+            # bot is not tracking (orphans from the change_bid /
+            # _cancel_ask silent-failure race) and untracks local state
+            # with no chain counterpart.
+            if (
+                self.config.reconcile_interval > 0
+                and not self.config.dry_run
+                and time.time() - self._last_reconcile >= self.config.reconcile_interval
+            ):
+                try:
+                    self._periodic_reconcile_against_chain()
+                except Exception as e:
+                    logger.warning(f"Periodic reconcile failed: {e}")
+                finally:
+                    self._last_reconcile = time.time()
 
             # Sleep until next poll interval
             elapsed = time.time() - cycle_start

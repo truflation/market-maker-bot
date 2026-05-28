@@ -359,6 +359,18 @@ class BotConfig:
     order_book_poll_interval: float = 2.0  # Seconds between order book polls
     inventory_refresh_interval: float = 30.0  # Seconds between inventory refresh
 
+    # Periodic on-chain orphan reconcile cadence (seconds). When > 0, the
+    # bot runs `_periodic_reconcile_against_chain` every N seconds to
+    # detect both directions of drift between local tracked state and the
+    # on-chain order book:
+    #   - tracked-but-not-on-chain  -> untrack locally
+    #   - on-chain-but-not-tracked  -> CANCEL the orphan
+    # The orphan-cancel direction is the fix for the known cancel-then-
+    # place silent-failure race in the `change_bid`/`_cancel_ask` paths.
+    # 0 disables (default, opt-in for safety so existing deployments do
+    # not change behavior). Recommended starting value: 60 (every 60s).
+    reconcile_interval: float = 0.0
+
     # Pricing source for mid-price determination
     # "black_scholes" = always use B-S fair value from underlying stream data (recommended
     #                    when there are few market participants)
@@ -406,6 +418,7 @@ def load_config_from_dict(data: dict) -> BotConfig:
         avellaneda=avellaneda_config,
         order_book_poll_interval=data.get("order_book_poll_interval", 2.0),
         inventory_refresh_interval=data.get("inventory_refresh_interval", 30.0),
+        reconcile_interval=data.get("reconcile_interval", 0.0),
         pricing_source=data.get("pricing_source", "black_scholes"),
         dry_run=data.get("dry_run", False),
         read_only=data.get("read_only", False),
