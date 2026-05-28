@@ -173,6 +173,38 @@ def test_reconcile_cap_caps_first_pass_at_20():
     assert bot._client.cancel_order.call_count == 20
 
 
+def test_reconcile_continues_on_get_order_book_rpc_failure():
+    """A gateway RPC failure on get_order_book for one (qid, outcome)
+    must NOT abort the whole pass. The catch-and-continue contract
+    keeps reconcile from going dark on a single transient flap."""
+    qid = 100
+    bot = _bot_mock(
+        tracked_orders=[],
+        order_books={(qid, True): [], (qid, False): []},
+    )
+    bot._client.get_order_book.side_effect = RuntimeError("gateway 503")
+
+    # Must NOT raise. No cancels, no untracks; just a logged warning.
+    AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+
+    bot._client.cancel_order.assert_not_called()
+
+
+def test_reconcile_skipped_in_dry_run_does_not_fetch():
+    """Symmetric with LP: dry-run aborts BEFORE fetching order books."""
+    qid = 100
+    bot = _bot_mock(
+        tracked_orders=[],
+        order_books={(qid, True): [_book_entry(TEST_WALLET, -50)]},
+    )
+    bot.config.dry_run = True
+
+    AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+
+    bot._client.cancel_order.assert_not_called()
+    bot._client.get_order_book.assert_not_called()
+
+
 def test_reconcile_untracks_stale_local_entries():
     """The other direction: local state has an entry that the chain
     doesn't show. Untrack it (existing startup-reconcile behavior,
