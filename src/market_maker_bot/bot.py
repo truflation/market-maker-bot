@@ -779,17 +779,24 @@ class AvellanedaMarketMaker:
         if self.config.dry_run:
             return
 
+        # MAA mode: our orders are owned by the MAA (execute_agent_action runs
+        # as the MAA), not the agent key that signs. Filtering the order book to
+        # the agent key matches nothing, so orphans never get cancelled and the
+        # bot retry-cancels non-existent orders forever. Use the MAA address.
         wallet_addr: Optional[str] = None
-        try:
-            key = self.config.private_key.strip()
-            if key.startswith("0x"):
-                key = key[2:]
-            if len(key) != 64:
-                raise ValueError("private_key must be 64 hex chars")
-            from eth_account import Account
-            wallet_addr = Account.from_key("0x" + key).address.lower()
-        except Exception:
-            wallet_addr = None
+        if getattr(self.config, "maa_address", ""):
+            wallet_addr = self.config.maa_address.strip().lower()
+        else:
+            try:
+                key = self.config.private_key.strip()
+                if key.startswith("0x"):
+                    key = key[2:]
+                if len(key) != 64:
+                    raise ValueError("private_key must be 64 hex chars")
+                from eth_account import Account
+                wallet_addr = Account.from_key("0x" + key).address.lower()
+            except Exception:
+                wallet_addr = None
         if wallet_addr is None:
             logger.warning(
                 "Periodic reconcile: could not derive wallet address; "
