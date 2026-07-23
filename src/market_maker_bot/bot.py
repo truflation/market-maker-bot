@@ -218,6 +218,13 @@ class AvellanedaMarketMaker:
         # In-flight cancellations (for should_wait_order_cancel_confirmation)
         self._in_flight_cancels: Set[str] = set()
         self._pre_settlement_pulled: Set[int] = set()
+        # Markets whose earnings cutoff has passed and whose resting orders have
+        # been pulled THIS session. In-memory on purpose (not persisted): the
+        # cutoff timestamp is the deterministic source of truth, so every
+        # (re)start re-cancels a past-earnings market's orders on the first cycle
+        # before it can quote -- a persisted "pulled" flag could go stale and
+        # leave leaked orders live (fail-open). This re-asserts each session.
+        self._earnings_pulled_session: Set[int] = set()
 
         # Order state persistence (for restart recovery)
         self._order_state = OrderStateManager(config.order_state_file)
@@ -2083,6 +2090,25 @@ class AvellanedaMarketMaker:
         Args:
             context: Market context to process
         """
+        # Earnings pull (evaluated first; fires ~1 week before settle_time). Once
+        # an EPS market's number is public (its earnings cutoff has passed), the
+        # 24/7 book is pick-off-able until settlement, so stop quoting this market
+        # and hold inventory (it settles for value at settle_time). Deterministic
+        # on earnings_cutoff_time. Re-asserted each session: the first cycle after
+        # any (re)start cancels resting orders before quoting, so a restart can
+        # never re-expose a pulled market. No config rewrite, no process restart.
+        ec = context.config.earnings_cutoff_time
+        if ec is not None and int(time.time()) >= ec:
+            if context.query_id not in self._earnings_pulled_session:
+                logger.info(
+                    f"Market {context.query_id}: past earnings cutoff "
+                    f"(cutoff={ec}, now={int(time.time())}). Pulling liquidity and "
+                    f"holding inventory until settlement."
+                )
+                self._cancel_market_orders(context)
+                self._earnings_pulled_session.add(context.query_id)
+            return
+
         # Liquidation mode: widen spreads and reduce inventory when T < 30 min
         liquidation_mode = False
         liquidation_skew_threshold = 0.3

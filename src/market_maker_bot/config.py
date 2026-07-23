@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any, List
 
 from .models import OutcomeMode
 from .execution_state import ExecutionTimeframeMode, ExecutionTimeframeConfig
+from . import earnings_schedule
 
 
 # =============================================================================
@@ -141,6 +142,17 @@ class MarketConfig:
     lower_bound: Optional[float] = None
     upper_bound: Optional[float] = None
     settle_time: Optional[int] = None
+    # Earnings-aware quote cutoff. For EPS markets the underlying number goes
+    # public at the company's earnings announcement ~1 week BEFORE settle_time;
+    # on a 24/7 book the resting orders are then pick-off-able until settlement.
+    # Set earnings_date (ET calendar day, "YYYY-MM-DD") + earnings_timing
+    # ("amc" after close / "bmo" before open); __post_init__ derives
+    # earnings_cutoff_time (unix seconds) via earnings_schedule, and the bot
+    # stops quoting this market (keeping inventory) once that cutoff passes.
+    # Both must be set together or neither. Leave unset for non-earnings markets.
+    earnings_date: Optional[str] = None
+    earnings_timing: Optional[str] = None
+    earnings_cutoff_time: Optional[int] = None  # derived; do not set in config
     # Per-outcome prior probability for YES, in [0.0, 1.0]. When set, the
     # bot uses this directly as fair YES (× 100 cents) instead of running
     # Black-Scholes on the underlying stream. Used for Hormuz markets where
@@ -155,6 +167,23 @@ class MarketConfig:
     def __post_init__(self):
         if not self.name:
             self.name = f"Market-{self.query_id}"
+        # Derive the earnings quote-cutoff from earnings_date + earnings_timing.
+        # Fail LOUD on a partial/invalid spec (raises) rather than silently
+        # quoting a market past its earnings print: an unusable earnings config
+        # must stop the bot at load, not fail open at runtime.
+        if self.earnings_date or self.earnings_timing:
+            if not (self.earnings_date and self.earnings_timing):
+                raise ValueError(
+                    f"Market {self.query_id}: earnings_date and earnings_timing "
+                    f"must both be set (got date={self.earnings_date!r} "
+                    f"timing={self.earnings_timing!r})"
+                )
+            self.earnings_cutoff_time = earnings_schedule.quote_cutoff_time(
+                self.earnings_date,
+                self.earnings_timing,
+                holidays=earnings_schedule.DEFAULT_HOLIDAYS,
+                early_closes=earnings_schedule.DEFAULT_EARLY_CLOSES,
+            )
 
 
 @dataclass
