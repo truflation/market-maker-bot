@@ -1623,6 +1623,29 @@ class AvellanedaMarketMaker:
             )
             return None, False
 
+        # Cross-outcome self-cross guard. place_split_limit_order lists BOTH
+        # legs: the intended ask (this outcome @ new_price) AND a byproduct
+        # ask on the OPPOSITE outcome @ (100 - new_price). Outcomes are quoted
+        # in separate passes, so the same-outcome self-match gate in
+        # _execute_order_updates never sees this cross-outcome case. If the
+        # byproduct leg lands at or below the opposite outcome's best bid it
+        # self-fills the instant it is listed; the next refresh's two-leg
+        # cancel then partial-fails in a tight loop (observed on low-priced
+        # books, e.g. GOOGL bucket 2 at 3 levels). Skip minting when the
+        # byproduct would cross.
+        byproduct_price = 100 - new_price
+        opp_state = context.get_state(not outcome)
+        opp_best_bid = opp_state.best_bid if opp_state else None
+        if opp_best_bid is not None and byproduct_price <= opp_best_bid:
+            logger.info(
+                f"Market {context.query_id} ask "
+                f"outcome={'YES' if outcome else 'NO'} @{new_price}c: skip "
+                f"split-mint (byproduct {'NO' if outcome else 'YES'} leg "
+                f"@{byproduct_price}c <= opposite best bid {opp_best_bid}c, "
+                f"would self-fill)."
+            )
+            return None, False
+
         self._client.place_split_limit_order(
             query_id=context.query_id,
             true_price=split_price,
@@ -1651,6 +1674,32 @@ class AvellanedaMarketMaker:
                 logger.error("Failed to cancel orphaned split order")
             raise sell_err
         return tx_hash, False
+
+    def _leg_still_on_book(
+        self, query_id: int, outcome: bool, price: int
+    ) -> bool:
+        """
+        Return True if an ASK at ``price`` for (query_id, outcome) is still
+        resting on chain. Used by _cancel_ask to distinguish a split-mint leg
+        that is genuinely gone (self-filled on placement, or lifted by a taker
+        between refreshes) from a real cancel failure.
+
+        Asks are stored with positive prices, so a resting leg matches the
+        cancel price exactly. On any error querying the book, return True
+        (conservative: treat as still-resting so the caller raises and
+        reconcile picks it up), preserving pre-existing behavior.
+        """
+        try:
+            entries = self._client.get_order_book(query_id, outcome)
+        except Exception:
+            return True
+        for e in entries:
+            try:
+                if int(e.get("price")) == price:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def _cancel_ask(
         self,
@@ -1715,7 +1764,19 @@ class AvellanedaMarketMaker:
                         wait=wait,
                     )
                 except Exception:
-                    any_failed = True
+                    # A cancel can fail because the leg is genuinely gone (it
+                    # self-filled on placement, or was lifted by a taker
+                    # between refreshes), not only because of a real chain
+                    # error. Re-check the book: only a leg still resting on
+                    # chain is a true failure worth surfacing (and leaving for
+                    # reconcile). A leg already off the book is effectively
+                    # cancelled, so treat it as success. On any doubt (still
+                    # resting, or the recheck itself errors) fall back to the
+                    # prior behavior and raise.
+                    if wait and self._leg_still_on_book(
+                        context.query_id, cancel_out, cancel_p
+                    ):
+                        any_failed = True
             if any_failed and wait:
                 raise RuntimeError(
                     f"split-mint cancel partially failed for "
