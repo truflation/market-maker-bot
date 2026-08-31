@@ -56,6 +56,11 @@ def _bot_mock(tracked_orders: list[TrackedOrder],
     bot = MagicMock()
     bot.config.dry_run = False
     bot.config.private_key = TEST_PRIVATE_KEY
+    # A MagicMock attribute is truthy, which would send the reconcile down
+    # the maa_address branch with a garbage address; real non-MAA configs
+    # carry "".
+    bot.config.maa_address = ""
+    bot._reconcile_cancel_attempts = {}
     qids = sorted({qid for qid, _ in order_books.keys()})
     bot._markets = {qid: MagicMock() for qid in qids}
 
@@ -221,3 +226,76 @@ def test_reconcile_untracks_stale_local_entries():
         qid, True, True, 50, 0,
     )
     bot._client.cancel_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Orphan cancel attempt budget (failed-cancel spam regression)
+# ---------------------------------------------------------------------------
+
+
+def _run_pass(bot):
+    AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+
+
+def test_orphan_cancels_stop_after_attempt_budget():
+    """A persistent orphan (cancel never lands: chain rejects it or the book
+    read is stale) is attempted ORPHAN_CANCEL_MAX_ATTEMPTS times total, then
+    suppressed on every later pass instead of spamming failed txs forever."""
+    from market_maker_bot.bot import ORPHAN_CANCEL_MAX_ATTEMPTS
+
+    qid = 100
+    books = {(qid, True): [_book_entry(TEST_WALLET, -50)], (qid, False): []}
+    bot = _bot_mock(tracked_orders=[], order_books=books)
+
+    for _ in range(ORPHAN_CANCEL_MAX_ATTEMPTS + 3):
+        _run_pass(bot)
+
+    assert bot._client.cancel_order.call_count == ORPHAN_CANCEL_MAX_ATTEMPTS
+
+
+def test_orphan_attempts_reset_once_the_orphan_leaves_the_book():
+    """Attempt bookkeeping is pruned when the orphan is gone, so a NEW order
+    at the same price later gets a fresh budget (it is a new orphan)."""
+    qid = 100
+    books = {(qid, True): [_book_entry(TEST_WALLET, -50)], (qid, False): []}
+    bot = _bot_mock(tracked_orders=[], order_books=books)
+
+    _run_pass(bot)
+    _run_pass(bot)
+    assert bot._client.cancel_order.call_count == 2
+
+    # Orphan finally cancelled/filled: an empty pass prunes its entry.
+    books[(qid, True)] = []
+    _run_pass(bot)
+    assert bot._reconcile_cancel_attempts == {}
+
+    # Same price reappears: fresh budget.
+    books[(qid, True)] = [_book_entry(TEST_WALLET, -50)]
+    _run_pass(bot)
+    assert bot._client.cancel_order.call_count == 3
+
+
+def test_stuck_orphan_storm_exits_for_restart():
+    """STUCK_ORPHANS_EXIT_THRESHOLD distinct uncancellable orphans mean the
+    process state is stale beyond repair; the bot exits with
+    EXIT_STALE_CANCEL_LOOP so systemd restarts it clean."""
+    from market_maker_bot.bot import (
+        EXIT_STALE_CANCEL_LOOP,
+        ORPHAN_CANCEL_MAX_ATTEMPTS,
+        STUCK_ORPHANS_EXIT_THRESHOLD,
+    )
+
+    qid = 100
+    entries = [
+        _book_entry(TEST_WALLET, -(10 + i))
+        for i in range(STUCK_ORPHANS_EXIT_THRESHOLD)
+    ]
+    bot = _bot_mock(tracked_orders=[], order_books={(qid, True): entries,
+                                                    (qid, False): []})
+
+    for _ in range(ORPHAN_CANCEL_MAX_ATTEMPTS):
+        _run_pass(bot)
+
+    with pytest.raises(SystemExit) as exc:
+        _run_pass(bot)
+    assert exc.value.code == EXIT_STALE_CANCEL_LOOP
