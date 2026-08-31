@@ -7,9 +7,11 @@ Coordinates all components: pricing, indicators, inventory, and order management
 import json
 import math
 import os
+import sys
 import time
 import logging
 import signal
+from collections import deque
 from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any, Set, TYPE_CHECKING
@@ -54,6 +56,34 @@ SETTLED_MARKET_ERRORS = (
     "already settled",
     "settled market",
 )
+
+# Exit code taken when cancels loop on "order not found" (see the block
+# below): the stale state behind that loop has no in-process fix, so the
+# recovery is a clean process restart by systemd. Numbered alongside the
+# pool exit codes used by the bounded-client builds (70, 71).
+EXIT_STALE_CANCEL_LOOP = 72
+
+# --- cancel "order not found" handling (2026-08-28 incident) ----------------
+# When the chain rejects a cancel with "Order not found or does not belong to
+# you", the order is definitively NOT on the book under our wallet. A stale
+# order-book read can keep "showing" such orders for hours; retrying the
+# cancel every cycle then produces a stream of failed transactions (observed:
+# ~55k over 31 hours at ~0.5/sec). The chain error text is authoritative over
+# any book read, so it is treated as "already cancelled" wherever it can be
+# observed (wait=True).
+CANCEL_NOT_FOUND_SNIPPET = "order not found or does not belong"
+# wait=False cancels (the reconcile orphan pass) never observe the error, so
+# that loop is broken by attempt-counting instead: an orphan still on the book
+# after this many cancel attempts is provably not cancellable from this
+# process (the tx fails on chain, or the book read is stale) and is skipped.
+ORPHAN_CANCEL_MAX_ATTEMPTS = 3
+# A restart is the proven cure for the stale state behind either loop (fresh
+# client, fresh connections). If this many DISTINCT orphans are stuck past
+# their attempt budget, or this many observed not-found errors land inside
+# the window, exit with EXIT_STALE_CANCEL_LOOP and restart clean.
+STUCK_ORPHANS_EXIT_THRESHOLD = 10
+CANCEL_NOT_FOUND_WINDOW_SEC = 600.0
+CANCEL_NOT_FOUND_EXIT_COUNT = 50
 
 
 # Minimum order notional enforced by TN's prediction-market protocol.
@@ -208,6 +238,11 @@ class AvellanedaMarketMaker:
         # Timing
         self._last_inventory_refresh = 0.0
         self._last_reconcile = 0.0
+        # Cancel-loop defenses (see the CANCEL_NOT_FOUND_SNIPPET block above).
+        # (query_id, outcome, signed_sdk_price) -> wait=False cancel attempts
+        self._reconcile_cancel_attempts: Dict[Tuple[int, bool, int], int] = {}
+        # Timestamps of observed on-chain "order not found" cancel failures.
+        self._cancel_not_found_times: "deque[float]" = deque()
 
         # Execution state (timeframe control)
         self._execution_state = self._create_execution_state()
@@ -819,6 +854,9 @@ class AvellanedaMarketMaker:
         MAX_CANCELS_PER_PASS = 20
         total_orphans = 0
         total_stale = 0
+        # Orphans enumerated this pass and orphans past their attempt budget.
+        pass_orphans: set[tuple[int, bool, int]] = set()
+        stuck_orphans: set[tuple[int, bool, int]] = set()
         for query_id, context in self._markets.items():
             bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
             asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
@@ -887,12 +925,23 @@ class AvellanedaMarketMaker:
                         break
                     if (outcome, True, price) in tracked_keys:
                         continue
+                    akey = (query_id, outcome, -price)
+                    pass_orphans.add(akey)
+                    if (
+                        self._reconcile_cancel_attempts.get(akey, 0)
+                        >= ORPHAN_CANCEL_MAX_ATTEMPTS
+                    ):
+                        stuck_orphans.add(akey)
+                        continue
                     try:
                         self._client.cancel_order(
                             query_id=query_id, outcome=outcome,
                             price=-price, wait=False,
                         )
                         orphan_cancels += 1
+                        self._reconcile_cancel_attempts[akey] = (
+                            self._reconcile_cancel_attempts.get(akey, 0) + 1
+                        )
                     except Exception as exc:
                         logger.warning(
                             f"Periodic reconcile: failed to cancel orphan "
@@ -904,12 +953,23 @@ class AvellanedaMarketMaker:
                         break
                     if (outcome, False, price) in tracked_keys:
                         continue
+                    akey = (query_id, outcome, price)
+                    pass_orphans.add(akey)
+                    if (
+                        self._reconcile_cancel_attempts.get(akey, 0)
+                        >= ORPHAN_CANCEL_MAX_ATTEMPTS
+                    ):
+                        stuck_orphans.add(akey)
+                        continue
                     try:
                         self._client.cancel_order(
                             query_id=query_id, outcome=outcome,
                             price=price, wait=False,
                         )
                         orphan_cancels += 1
+                        self._reconcile_cancel_attempts[akey] = (
+                            self._reconcile_cancel_attempts.get(akey, 0) + 1
+                        )
                     except Exception as exc:
                         logger.warning(
                             f"Periodic reconcile: failed to cancel orphan "
@@ -920,10 +980,37 @@ class AvellanedaMarketMaker:
             total_orphans += orphan_cancels
             total_stale += stale
 
+        # Attempt bookkeeping. Prune entries for orphans that finally left
+        # the book -- but only when the pass enumerated every book (a pass
+        # that hit the cancel cap broke out early, so absence from
+        # pass_orphans proves nothing on such a pass). A pruned key that
+        # reappears gets a fresh attempt budget on purpose: a NEW order at
+        # the same price is a new orphan.
+        if total_orphans < MAX_CANCELS_PER_PASS:
+            for akey in list(self._reconcile_cancel_attempts):
+                if akey not in pass_orphans:
+                    del self._reconcile_cancel_attempts[akey]
+
+        if stuck_orphans:
+            logger.error(
+                f"Periodic reconcile: {len(stuck_orphans)} orphan(s) still "
+                f"on the book after {ORPHAN_CANCEL_MAX_ATTEMPTS} cancel "
+                f"attempts each; suppressing further cancels for them (the "
+                f"chain rejects the cancel, or the book read is stale)"
+            )
+            if len(stuck_orphans) >= STUCK_ORPHANS_EXIT_THRESHOLD:
+                logger.critical(
+                    f"{len(stuck_orphans)} distinct orphans are "
+                    f"uncancellable (stale-state pattern). Exiting "
+                    f"{EXIT_STALE_CANCEL_LOOP} for a clean restart."
+                )
+                sys.exit(EXIT_STALE_CANCEL_LOOP)
+
         logger.info(
             f"Periodic reconcile pass: "
             f"{total_orphans} on-chain orphans cancelled, "
-            f"{total_stale} stale local entries untracked across "
+            f"{total_stale} stale local entries untracked, "
+            f"{len(stuck_orphans)} stuck orphans suppressed across "
             f"{len(self._markets)} markets"
         )
 
@@ -1708,6 +1795,43 @@ class AvellanedaMarketMaker:
                 continue
         return False
 
+    @staticmethod
+    def _is_cancel_not_found(exc: BaseException) -> bool:
+        """True if a chain cancel failure says the order is not on the book.
+
+        The node's own error text is decisive: unlike a get_order_book
+        recheck it cannot be stale.
+        """
+        return CANCEL_NOT_FOUND_SNIPPET in str(exc).lower()
+
+    def _note_cancel_not_found(self, query_id: int, detail: str) -> None:
+        """Record an observed not-found cancel failure; exit for a clean
+        restart if they storm (stale in-process state has no in-process
+        fix, and occasional single not-founds are normal self-fill races).
+        """
+        now = time.time()
+        self._cancel_not_found_times.append(now)
+        while (
+            self._cancel_not_found_times
+            and now - self._cancel_not_found_times[0]
+            > CANCEL_NOT_FOUND_WINDOW_SEC
+        ):
+            self._cancel_not_found_times.popleft()
+        count = len(self._cancel_not_found_times)
+        logger.warning(
+            f"Market {query_id}: cancel target already gone on chain "
+            f"({detail}); treating as cancelled ({count} not-found "
+            f"cancels in the last {CANCEL_NOT_FOUND_WINDOW_SEC:.0f}s)"
+        )
+        if count >= CANCEL_NOT_FOUND_EXIT_COUNT:
+            logger.critical(
+                f"{count} 'order not found' cancel failures within "
+                f"{CANCEL_NOT_FOUND_WINDOW_SEC:.0f}s: local state or reads "
+                f"are stale beyond in-process repair. "
+                f"Exiting {EXIT_STALE_CANCEL_LOOP} for a clean restart."
+            )
+            sys.exit(EXIT_STALE_CANCEL_LOOP)
+
     def _cancel_ask(
         self,
         context: MarketContext,
@@ -1751,12 +1875,22 @@ class AvellanedaMarketMaker:
                     price=price,
                     wait=wait,
                 )
-            except Exception:
-                if wait:
+            except Exception as exc:
+                if wait and not self._is_cancel_not_found(exc):
                     # Do not release the reservation: the order may still
                     # be on chain; let the caller's exception handler skip
                     # untrack so reconcile picks it up next cycle.
                     raise
+                if wait:
+                    # "Order not found": the chain says the order is gone
+                    # (filled, or already cancelled). Retrying it forever
+                    # produces a failed-tx stream; treat as cancelled and
+                    # let the periodic inventory refresh absorb any drift
+                    # from a fill.
+                    self._note_cancel_not_found(
+                        context.query_id,
+                        f"ask {'YES' if outcome else 'NO'} {price}c",
+                    )
                 # wait=False: best-effort, fall through to release.
             inv.release_pair(outcome, amount)
         else:
@@ -1770,17 +1904,24 @@ class AvellanedaMarketMaker:
                         price=cancel_p,
                         wait=wait,
                     )
-                except Exception:
+                except Exception as exc:
                     # A cancel can fail because the leg is genuinely gone (it
                     # self-filled on placement, or was lifted by a taker
                     # between refreshes), not only because of a real chain
-                    # error. Re-check the book: only a leg still resting on
-                    # chain is a true failure worth surfacing (and leaving for
-                    # reconcile). A leg already off the book is effectively
-                    # cancelled, so treat it as success. On any doubt (still
-                    # resting, or the recheck itself errors) fall back to the
-                    # prior behavior and raise.
-                    if wait and self._leg_still_on_book(
+                    # error. The chain's own "order not found" is decisive
+                    # and beats any book recheck (a stale read can keep a
+                    # dropped leg "on book"). Otherwise re-check the book:
+                    # only a leg still resting on chain is a true failure
+                    # worth surfacing (and leaving for reconcile). On any
+                    # doubt (still resting, or the recheck itself errors)
+                    # fall back to the prior behavior and raise.
+                    if self._is_cancel_not_found(exc):
+                        self._note_cancel_not_found(
+                            context.query_id,
+                            f"split leg {'YES' if cancel_out else 'NO'} "
+                            f"{cancel_p}c",
+                        )
+                    elif wait and self._leg_still_on_book(
                         context.query_id, cancel_out, cancel_p
                     ):
                         any_failed = True
