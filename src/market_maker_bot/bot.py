@@ -49,6 +49,7 @@ from .execution_state import (
 )
 from .hanging_orders import HangingOrdersTracker, HangingOrder, CreatedPairOfOrders
 from .order_state import OrderStateManager, TrackedOrder
+from .bid_budget import BidBudget
 
 logger = logging.getLogger(__name__)
 
@@ -503,6 +504,42 @@ class AvellanedaMarketMaker:
                 f"mode={market_config.outcome_mode.value}"
             )
 
+        # Per-market bid-collateral caps (2026-09-07 incident, #43): the cap
+        # is what honest quoting could ever need, times a safety multiplier.
+        # No order-book read can raise it.
+        caps: dict[int, int] = {}
+        mult = getattr(self.config, "bid_budget_multiplier", 1.5)
+        if mult and mult > 0:
+            levels = max(1, self.config.avellaneda.order_levels)
+            for qid, ctx in self._markets.items():
+                oda = ctx.config.order_dollar_amount
+                if not oda:
+                    continue
+                per_outcome = int(oda * 100) * levels
+                backstop = 0
+                if getattr(self.config, "backstop_amount", 0):
+                    backstop = (
+                        self.config.backstop_price_cents
+                        * self.config.backstop_amount
+                    )
+                caps[qid] = int((per_outcome + backstop) * 2 * mult)
+        self._bid_budget = BidBudget(caps)
+        if caps:
+            if self.config.reconcile_interval <= 0:
+                # The budget's only true-down is the periodic reconcile's
+                # sync; without it every fill/cancel leaks committed budget
+                # until each market silently stops bidding at its cap
+                # (review finding 7). Refuse the combination loudly.
+                raise ValueError(
+                    "bid budget requires the periodic reconcile: set "
+                    "reconcile_interval > 0 (recommended 60) or disable "
+                    "the budget with bid_budget_multiplier: 0"
+                )
+            logger.info(
+                f"Bid budget enabled on {len(caps)} markets "
+                f"(multiplier {mult})"
+            )
+
     def _reconcile_orders_on_startup(self) -> None:
         """
         Reconcile tracked orders with the order book on startup.
@@ -637,6 +674,21 @@ class AvellanedaMarketMaker:
                     # carry them forward across restarts. Better to lose a few
                     # legitimate tracked entries on a transient failure than
                     # to accumulate thousands of stale ones over time.
+                    # 2026-09-07 (#43): but the orders may STILL REST on chain
+                    # (the read failed, they were not confirmed gone), so seed
+                    # the bid budget with their cost. This stops a restart
+                    # into a degraded gateway from re-placing on top of them;
+                    # the first successful periodic reconcile trues it up.
+                    seed_cents = sum(
+                        t.price * t.amount for t in outcome_orders if t.is_buy
+                    )
+                    if seed_cents:
+                        self._bid_budget.seed(query_id, seed_cents)
+                        logger.warning(
+                            f"Market {query_id}: seeding bid budget with "
+                            f"{seed_cents} cent-shares of unverifiable "
+                            f"previously-tracked bids"
+                        )
                     logger.error(
                         f"Failed to reconcile orders for market {query_id} "
                         f"outcome={outcome}: {e}; untracking {len(outcome_orders)} "
@@ -852,6 +904,28 @@ class AvellanedaMarketMaker:
         # to subsequent passes; reconcile is idempotent so the next pass
         # will pick them up.
         MAX_CANCELS_PER_PASS = 20
+        # Backstop placements are wait=True broadcasts; cap them per pass so
+        # first activation on a large config cannot park the loop past the
+        # watchdog timeout (review finding 5). Reconcile is idempotent, so
+        # later passes finish the job.
+        MAX_BACKSTOPS_PER_PASS = 10
+        backstops_placed = 0
+        # Budget refunds require a fresh gateway (review finding 1).
+        gateway_fresh = self._gateway_fresh()
+        if gateway_fresh:
+            self._fresh_probe_failures = 0
+        else:
+            self._fresh_probe_failures = getattr(
+                self, "_fresh_probe_failures", 0
+            ) + 1
+            if self._fresh_probe_failures in (10, 100, 1000):
+                logger.warning(
+                    f"Gateway freshness probe has failed "
+                    f"{self._fresh_probe_failures} consecutive passes; "
+                    f"budget refunds are paused. If node_url does not serve "
+                    f"/api/v1/health this pauses them FOREVER and markets "
+                    f"will ratchet to their bid caps."
+                )
         total_orphans = 0
         total_stale = 0
         # Orphans enumerated this pass and orphans past their attempt budget.
@@ -860,17 +934,36 @@ class AvellanedaMarketMaker:
         for query_id, context in self._markets.items():
             bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
             asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
+            # 2026-09-07 incident (#43): a failed read left bids/asks empty,
+            # and the stale pass below then untracked EVERY order for that
+            # outcome as if the chain had confirmed them gone. The quote
+            # engine re-placed on top of the invisible resting orders each
+            # pass until the wallet drained. An unreadable book is UNKNOWN,
+            # not empty: skip both the untrack and orphan passes for any
+            # outcome whose read failed.
+            read_ok: dict[bool, bool] = {True: False, False: False}
+            market_min_ask: dict[bool, int] = {}
 
             for outcome in (True, False):
                 try:
                     entries = self._client.get_order_book(query_id, outcome)
+                    read_ok[outcome] = True
                 except Exception as exc:
                     logger.warning(
                         f"Periodic reconcile: get_order_book("
-                        f"{query_id}, {outcome}) failed: {exc}"
+                        f"{query_id}, {outcome}) failed: {exc}; treating book "
+                        f"as UNREADABLE (no untrack/orphan action this pass)"
                     )
                     continue
                 for entry in entries:
+                    raw_p = entry.get("price")
+                    if raw_p is not None and raw_p > 0:
+                        # Min ask across ALL wallets: the backstop cross-guard
+                        # must see third-party asks too (re-review finding 2);
+                        # the dicts below are wallet-filtered.
+                        cur_min = market_min_ask.get(outcome)
+                        if cur_min is None or raw_p < cur_min:
+                            market_min_ask[outcome] = raw_p
                     owner = entry.get("wallet_address")
                     if owner is None:
                         continue
@@ -899,6 +992,12 @@ class AvellanedaMarketMaker:
             tracked_orders = self._order_state.get_market_orders(query_id)
             stale = 0
             for tracked in tracked_orders:
+                if not read_ok[tracked.outcome]:
+                    # Book unreadable: keep the order tracked (see above).
+                    tracked_keys.add(
+                        (tracked.outcome, tracked.is_buy, tracked.price)
+                    )
+                    continue
                 if tracked.is_buy:
                     is_active = tracked.price in bids[tracked.outcome]
                 else:
@@ -924,6 +1023,16 @@ class AvellanedaMarketMaker:
                     if total_orphans + orphan_cancels >= MAX_CANCELS_PER_PASS:
                         break
                     if (outcome, True, price) in tracked_keys:
+                        continue
+                    if (
+                        getattr(self.config, "backstop_amount", 0)
+                        and price == self.config.backstop_price_cents
+                        and bids[outcome][price] <= self.config.backstop_amount
+                    ):
+                        # Backstop bids are deliberately untracked by the
+                        # quote engine; they are not orphans. Bounded by
+                        # amount so incident-leftover bids that happen to
+                        # rest at this price stay cancellable.
                         continue
                     akey = (query_id, outcome, -price)
                     pass_orphans.add(akey)
@@ -976,6 +1085,77 @@ class AvellanedaMarketMaker:
                             f"ask qid={query_id} {'YES' if outcome else 'NO'} "
                             f"{price}c: {exc}"
                         )
+
+            # Budget truth-up + backstop maintenance, only from a fully
+            # successful read of both outcomes (#43).
+            if read_ok[True] and read_ok[False]:
+                resting_bid_cents = sum(
+                    price * amount
+                    for outcome in (True, False)
+                    for price, amount in bids[outcome].items()
+                )
+                self._bid_budget.sync(
+                    query_id, resting_bid_cents, fresh=gateway_fresh
+                )
+
+                bs_amount = getattr(self.config, "backstop_amount", 0)
+                if bs_amount and not self.config.read_only:
+                    bs_price = self.config.backstop_price_cents
+                    now_bs = int(time.time())
+                    settle_ts = context.config.settle_time
+                    cutoff_ok = (
+                        settle_ts is None
+                        or now_bs < settle_ts - self.config.pre_settlement_cutoff
+                    )
+                    if (
+                        cutoff_ok
+                        and query_id not in self._pre_settlement_pulled
+                        and query_id not in self._earnings_pulled_session
+                    ):
+                        for outcome in (True, False):
+                            if backstops_placed >= MAX_BACKSTOPS_PER_PASS:
+                                break
+                            if bs_price in bids[outcome]:
+                                continue
+                            # Never cross an ask (review finding 2): deep-OTM
+                            # books legitimately quote 1-2c asks (our own
+                            # included); a crossing backstop self-fills every
+                            # pass, a perpetual drain. The book was read this
+                            # pass; use it.
+                            min_ask = market_min_ask.get(outcome)
+                            if min_ask is not None and min_ask <= bs_price:
+                                logger.info(
+                                    f"Backstop skipped market {query_id} "
+                                    f"{'YES' if outcome else 'NO'}: best ask "
+                                    f"{min_ask}c <= backstop {bs_price}c "
+                                    f"(any wallet)"
+                                )
+                                continue
+                            if not self._bid_budget.try_reserve(
+                                query_id, bs_price, bs_amount
+                            ):
+                                continue
+                            try:
+                                self._client.place_buy_order(
+                                    query_id=query_id, outcome=outcome,
+                                    price=bs_price, amount=bs_amount,
+                                    wait=True,
+                                )
+                                backstops_placed += 1
+                                logger.info(
+                                    f"Backstop bid placed: market {query_id} "
+                                    f"{'YES' if outcome else 'NO'} @{bs_price}c "
+                                    f"x{bs_amount}"
+                                )
+                            except Exception as exc:
+                                if self._is_definitive_rejection(exc):
+                                    self._bid_budget.release(
+                                        query_id, bs_price, bs_amount
+                                    )
+                                logger.warning(
+                                    f"Backstop bid failed: market {query_id} "
+                                    f"{'YES' if outcome else 'NO'}: {exc}"
+                                )
 
             total_orphans += orphan_cancels
             total_stale += stale
@@ -1796,6 +1976,38 @@ class AvellanedaMarketMaker:
         return False
 
     @staticmethod
+    def _is_definitive_rejection(exc: BaseException) -> bool:
+        """True only for errors that prove the order NEVER rested (so its
+        budget reservation may be released). A timeout / dropped connection /
+        unconfirmed-tx error is UNKNOWN - the broadcast may still land - and
+        must keep the reservation (review finding 4); the next fresh
+        reconcile sync trues it up."""
+        s = str(exc).lower()
+        return (
+            "insufficient balance" in s
+            or "below min" in s
+            or "must be" in s
+            or ("invalid" in s and "nonce" not in s)
+        )
+
+    def _gateway_fresh(self) -> bool:
+        """One cheap health probe: is the gateway serving CURRENT state?
+        Used to gate budget refunds (review finding 1) - a stale replica
+        answers reads with old snapshots while returning 200s. Any failure
+        counts as not-fresh."""
+        try:
+            import urllib.request as _ur
+            url = self.config.node_url.rstrip("/") + "/api/v1/health"
+            with _ur.urlopen(url, timeout=5) as resp:
+                h = json.loads(resp.read())
+            u = h.get("services", {}).get("user", {})
+            return bool(u.get("healthy")) and float(
+                u.get("block_age", 9e9)
+            ) < 120_000  # ms
+        except Exception:
+            return False
+
+    @staticmethod
     def _is_cancel_not_found(exc: BaseException) -> bool:
         """True if a chain cancel failure says the order is not on the book.
 
@@ -2022,14 +2234,46 @@ class AvellanedaMarketMaker:
                             f"Keeping old bid @{current_order.price}c on book."
                         )
                         return None
-                    tx_hash = self._client.change_bid(
-                        query_id=context.query_id,
-                        outcome=outcome,
-                        old_price=old_sdk_price,
-                        new_price=new_sdk_price,
-                        new_amount=amount,
-                        wait=True,
-                    )
+                    if (
+                        getattr(self.config, "backstop_amount", 0)
+                        and new_price <= self.config.backstop_price_cents
+                    ):
+                        logger.info(
+                            f"Market {context.query_id} BID L{level_idx}: "
+                            f"skip quote at {new_price}c (backstop price "
+                            f"slot {self.config.backstop_price_cents}c is "
+                            f"reserved; chain keys orders by price)"
+                        )
+                        return None
+                    if not self._bid_budget.reserve_delta(
+                        context.query_id, current_order.price,
+                        current_order.amount, new_price, amount,
+                    ):
+                        logger.warning(
+                            f"Market {context.query_id} BID L{level_idx}: bid "
+                            f"budget exhausted for change_bid; skipping update"
+                        )
+                        return None
+                    try:
+                        tx_hash = self._client.change_bid(
+                            query_id=context.query_id,
+                            outcome=outcome,
+                            old_price=old_sdk_price,
+                            new_price=new_sdk_price,
+                            new_amount=amount,
+                            wait=True,
+                        )
+                    except Exception:
+                        # Reverse the delta (review finding 3): the swap did
+                        # not happen, so the OLD bid's accounting must stand.
+                        # Without this, a shrinking update re-applies its
+                        # negative delta on every failed retry and ratchets
+                        # committed toward zero while the big bid still rests.
+                        self._bid_budget.reserve_delta(
+                            context.query_id, new_price, amount,
+                            current_order.price, current_order.amount,
+                        )
+                        raise
                 else:
                     # Pre-check: can either the inventory or split-mint path
                     # place this ask at all? If not, leave the old ask on the
@@ -2135,13 +2379,46 @@ class AvellanedaMarketMaker:
                             f"{new_price * amount} < min {MIN_ORDER_NOTIONAL_CENT_SHARES})"
                         )
                         return None
-                    tx_hash = self._client.place_buy_order(
-                        query_id=context.query_id,
-                        outcome=outcome,
-                        price=new_price,
-                        amount=amount,
-                        wait=True,
-                    )
+                    if (
+                        getattr(self.config, "backstop_amount", 0)
+                        and new_price <= self.config.backstop_price_cents
+                    ):
+                        logger.info(
+                            f"Market {context.query_id} BID L{level_idx}: "
+                            f"skip quote at {new_price}c (backstop price "
+                            f"slot {self.config.backstop_price_cents}c is "
+                            f"reserved; chain keys orders by price)"
+                        )
+                        return None
+                    if not self._bid_budget.try_reserve(
+                        context.query_id, new_price, amount
+                    ):
+                        logger.warning(
+                            f"Market {context.query_id} BID L{level_idx}: bid "
+                            f"budget exhausted ({self._bid_budget.committed(context.query_id)}"
+                            f"/{self._bid_budget.cap(context.query_id)} cent-shares "
+                            f"committed); skipping placement until reconcile "
+                            f"confirms resting state"
+                        )
+                        return None
+                    try:
+                        tx_hash = self._client.place_buy_order(
+                            query_id=context.query_id,
+                            outcome=outcome,
+                            price=new_price,
+                            amount=amount,
+                            wait=True,
+                        )
+                    except Exception as place_exc:
+                        # Release only when the chain PROVED the order never
+                        # rested; a timeout may still land on chain, and its
+                        # reservation must stand until a fresh sync (review
+                        # finding 4).
+                        if self._is_definitive_rejection(place_exc):
+                            self._bid_budget.release(
+                                context.query_id, new_price, amount
+                            )
+                        raise
                 else:
                     # Inventory-aware ASK: prefer existing held YES/NO shares
                     # (single-leg, no new collateral), fall back to split-mint
@@ -2504,6 +2781,14 @@ class AvellanedaMarketMaker:
                     )
                     continue
                 if order.is_buy:
+                    if not self._bid_budget.try_reserve(
+                        context.query_id, order.price, order.amount
+                    ):
+                        logger.warning(
+                            f"Market {context.query_id}: bid budget exhausted; "
+                            f"skipping hanging order recreate"
+                        )
+                        continue
                     tx_hash = self._client.place_buy_order(
                         query_id=context.query_id,
                         outcome=outcome,
@@ -2525,6 +2810,10 @@ class AvellanedaMarketMaker:
                     f"Recreated hanging order at {order.price}¢ (was {order.order_id})"
                 )
             except Exception as e:
+                if order.is_buy and self._is_definitive_rejection(e):
+                    self._bid_budget.release(
+                        context.query_id, order.price, order.amount
+                    )
                 logger.error(f"Failed to recreate hanging order: {e}")
 
     def _execute_order_override(
@@ -2558,6 +2847,14 @@ class AvellanedaMarketMaker:
                     )
                     continue
                 if side_str == "buy":
+                    if not self._bid_budget.try_reserve(
+                        context.query_id, price, amount
+                    ):
+                        logger.warning(
+                            f"Market {context.query_id}: bid budget exhausted; "
+                            f"skipping override buy"
+                        )
+                        continue
                     tx_hash = self._client.place_buy_order(
                         query_id=context.query_id,
                         outcome=outcome,
@@ -2579,6 +2876,8 @@ class AvellanedaMarketMaker:
                     f"Placed override {side_str} @{price}¢ x{amount}"
                 )
             except Exception as e:
+                if side_str == "buy" and self._is_definitive_rejection(e):
+                    self._bid_budget.release(context.query_id, price, amount)
                 logger.error(f"Failed to place override order: {e}")
 
     def _main_loop(self) -> None:

@@ -422,6 +422,20 @@ class BotConfig:
     # startup before broadcasting any split-mint. None disables the cap.
     # Sized in dollars (each pair = $1). Recommended on mainnet; off on testnet.
     pre_mint_max_total_collateral_usd: Optional[float] = None
+    # Per-market bid-collateral cap, as a multiple of the market's intended
+    # bid demand (order_dollar_amount x order_levels x both outcomes). The
+    # bot refuses to place a bid that would push a market's committed bid
+    # collateral past this cap, no matter what its order-book reads claim
+    # (2026-09-07 incident: failed reads made the bot re-place bids on top
+    # of invisible resting ones until the wallet drained). 0 disables.
+    bid_budget_multiplier: float = 1.5
+    # Backstop bids: one small deep-out-of-the-money bid per market/outcome
+    # at backstop_price_cents, placed by the periodic reconcile and excluded
+    # from the normal quote refresh, so a book never renders completely
+    # empty during restarts or outages (the discovery tiles derive a value
+    # from any single resting order). backstop_amount = 0 disables.
+    backstop_price_cents: int = 2
+    backstop_amount: int = 0
 
 
 def load_config_from_dict(data: dict) -> BotConfig:
@@ -456,4 +470,7 @@ def load_config_from_dict(data: dict) -> BotConfig:
         order_state_file=data.get("order_state_file", "bot_order_state.json"),
         pre_settlement_cutoff=data.get("pre_settlement_cutoff", 900.0),
         pre_mint_max_total_collateral_usd=data.get("pre_mint_max_total_collateral_usd"),
+        bid_budget_multiplier=data.get("bid_budget_multiplier", 1.5),
+        backstop_price_cents=data.get("backstop_price_cents", 2),
+        backstop_amount=data.get("backstop_amount", 0),
     )
