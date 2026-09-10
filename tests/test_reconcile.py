@@ -63,6 +63,10 @@ def _bot_mock(tracked_orders: list[TrackedOrder],
     bot._reconcile_cancel_attempts = {}
     qids = sorted({qid for qid, _ in order_books.keys()})
     bot._markets = {qid: MagicMock() for qid in qids}
+    # A MagicMock settle_time is truthy and non-comparable; real configs
+    # carry None or an int epoch. None = live market (reconcile runs).
+    for ctx in bot._markets.values():
+        ctx.config.settle_time = None
 
     state = MagicMock()
     by_market: dict[int, list[TrackedOrder]] = {}
