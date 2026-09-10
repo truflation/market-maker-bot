@@ -436,6 +436,22 @@ class BotConfig:
     # from any single resting order). backstop_amount = 0 disables.
     backstop_price_cents: int = 2
     backstop_amount: int = 0
+    # Level loop breaker: after `level_loop_threshold` "order not found"
+    # clears on the SAME (market, outcome, side, price) slot within
+    # `level_loop_window` seconds, stop quoting that exact slot for
+    # `level_loop_cooldown` seconds and log at ERROR (2026-09-09 Eggs
+    # 72c storm: two levels fighting over one chain price slot cleared
+    # and re-placed every cycle, ~1,500 failed txs per 30 min). A fill
+    # also produces a legitimate not-found on the next change, so the
+    # threshold counts a rolling window, not a lifetime total. Default 4:
+    # three fast fills of one price inside two minutes is plausible real
+    # taker flow on a settle-day book (pulling the touch then would cost
+    # exactly the liquidity being lifted), while a genuine loop cycles
+    # every ~2s and trips 4 in under 10s regardless.
+    # level_loop_threshold = 0 disables the breaker.
+    level_loop_threshold: int = 4
+    level_loop_window: float = 120.0
+    level_loop_cooldown: float = 300.0
 
 
 def load_config_from_dict(data: dict) -> BotConfig:
@@ -473,4 +489,7 @@ def load_config_from_dict(data: dict) -> BotConfig:
         bid_budget_multiplier=data.get("bid_budget_multiplier", 1.5),
         backstop_price_cents=data.get("backstop_price_cents", 2),
         backstop_amount=data.get("backstop_amount", 0),
+        level_loop_threshold=data.get("level_loop_threshold", 4),
+        level_loop_window=data.get("level_loop_window", 120.0),
+        level_loop_cooldown=data.get("level_loop_cooldown", 300.0),
     )

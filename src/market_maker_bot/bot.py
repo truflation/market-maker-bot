@@ -73,6 +73,11 @@ EXIT_STALE_CANCEL_LOOP = 72
 # any book read, so it is treated as "already cancelled" wherever it can be
 # observed (wait=True).
 CANCEL_NOT_FOUND_SNIPPET = "order not found or does not belong"
+
+# Slot-guard stall escalation: a level skipping this many CONSECUTIVE
+# cycles (its target price owned by another level) is not a passing grid
+# shift, it is wedged tracking. ~5 min at a 2s cycle.
+SLOT_GUARD_STALL_ERROR_EVERY = 150
 # wait=False cancels (the reconcile orphan pass) never observe the error, so
 # that loop is broken by attempt-counting instead: an orphan still on the book
 # after this many cancel attempts is provably not cancellable from this
@@ -244,6 +249,19 @@ class AvellanedaMarketMaker:
         self._reconcile_cancel_attempts: Dict[Tuple[int, bool, int], int] = {}
         # Timestamps of observed on-chain "order not found" cancel failures.
         self._cancel_not_found_times: "deque[float]" = deque()
+        # Level loop breaker (2026-09-09 Eggs 72c storm): recent "order not
+        # found" CLEAR timestamps per exact quote slot, and the epoch until
+        # which a tripped slot is suppressed from quoting.
+        # Key: (query_id, outcome, is_buy, display_price).
+        self._level_not_found_times: Dict[
+            Tuple[int, bool, bool, int], "deque[float]"
+        ] = {}
+        self._level_cooldown_until: Dict[Tuple[int, bool, bool, int], float] = {}
+        # Consecutive slot-guard skips per (query_id, outcome, is_buy,
+        # level_idx). A grid shift stalls a level for a cycle or two; a
+        # level stalled for hundreds of cycles means tracking is wedged
+        # (e.g. a zombie duplicate slot) and must page, not whisper INFO.
+        self._slot_guard_skips: Dict[Tuple[int, bool, bool, int], int] = {}
 
         # Execution state (timeframe control)
         self._execution_state = self._create_execution_state()
@@ -594,7 +612,15 @@ class AvellanedaMarketMaker:
                 stale += len(orders)
                 continue
 
-            # Fetch current order book for this market
+            # Fetch current order book for this market.
+            # The chain holds ONE order per (outcome, side, price); state
+            # files written before the slot-collision guard existed can
+            # carry two levels at the same price (the 09-09 Eggs 72c
+            # incident wrote such duplicates). Recovering both would
+            # re-seed the collision loop with the guard unable to see it,
+            # so only the first tracked entry per slot is recovered and
+            # the rest are dropped as stale.
+            recovered_slots: set[tuple[bool, bool, int]] = set()
             for outcome in [True, False]:
                 outcome_orders = [o for o in orders if o.outcome == outcome]
                 if not outcome_orders:
@@ -626,7 +652,25 @@ class AvellanedaMarketMaker:
                                 for entry in state.ask_levels
                             )
 
+                        slot = (outcome, tracked.is_buy, tracked.price)
+                        if is_on_book and slot in recovered_slots:
+                            self._order_state.untrack_order(
+                                query_id, outcome, tracked.is_buy,
+                                tracked.price, tracked.level_idx,
+                            )
+                            stale += 1
+                            logger.warning(
+                                f"Duplicate tracked slot dropped: market "
+                                f"{query_id} {'YES' if outcome else 'NO'} "
+                                f"{'buy' if tracked.is_buy else 'sell'} "
+                                f"@{tracked.price}¢ L{tracked.level_idx} "
+                                f"(another level already recovered this "
+                                f"chain price slot)"
+                            )
+                            continue
+
                         if is_on_book:
+                            recovered_slots.add(slot)
                             # Order is still active - record it in context
                             side = Side.BID if tracked.is_buy else Side.ASK
                             order_mgr = OrderManager(
@@ -932,6 +976,13 @@ class AvellanedaMarketMaker:
         pass_orphans: set[tuple[int, bool, int]] = set()
         stuck_orphans: set[tuple[int, bool, int]] = set()
         for query_id, context in self._markets.items():
+            # Settled market (roller configs can carry a just-settled rung
+            # for up to one roller tick): its book is gone or frozen, orphan
+            # cancels against it are guaranteed failed txs, and the budget
+            # has nothing left to true up. Skip entirely.
+            settle_ts_mkt = context.config.settle_time
+            if settle_ts_mkt is not None and time.time() >= settle_ts_mkt:
+                continue
             bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
             asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
             # 2026-09-07 incident (#43): a failed read left bids/asks empty,
@@ -2044,6 +2095,58 @@ class AvellanedaMarketMaker:
             )
             sys.exit(EXIT_STALE_CANCEL_LOOP)
 
+    def _note_level_not_found_clear(
+        self, query_id: int, outcome: bool, side: Side, price: int
+    ) -> None:
+        """Record a not-found CLEAR on one exact quote slot; trip a per-slot
+        cooldown when they repeat inside the window.
+
+        Distinct from _note_cancel_not_found (process-wide storm counter):
+        this one targets the single-slot placement/clear loop where two
+        levels fight over one chain price. A restart does not fix that
+        loop; refusing to re-quote the contested slot does.
+        NOT reset on successful placement -- the loop's signature is
+        alternating success/not-found, so a success-reset would blind it.
+        """
+        threshold = getattr(self.config, "level_loop_threshold", 4)
+        if threshold <= 0:
+            return
+        window = getattr(self.config, "level_loop_window", 120.0)
+        key = (query_id, outcome, side == Side.BID, price)
+        now = time.time()
+        times = self._level_not_found_times.setdefault(key, deque())
+        times.append(now)
+        while times and now - times[0] > window:
+            times.popleft()
+        if len(times) >= threshold:
+            cooldown = getattr(self.config, "level_loop_cooldown", 300.0)
+            self._level_cooldown_until[key] = now + cooldown
+            times.clear()
+            logger.error(
+                f"LEVEL LOOP BREAKER: market {query_id} "
+                f"{'YES' if outcome else 'NO'} {side.value} @{price}c hit "
+                f"{threshold} 'order not found' clears in {window:.0f}s; "
+                f"suppressing quotes on this slot for {cooldown:.0f}s"
+            )
+
+    def _level_slot_cooling(
+        self, query_id: int, outcome: bool, side: Side, price: int
+    ) -> bool:
+        """True if the loop breaker is suppressing this exact quote slot."""
+        key = (query_id, outcome, side == Side.BID, price)
+        until = self._level_cooldown_until.get(key)
+        if until is None:
+            return False
+        if time.time() >= until:
+            del self._level_cooldown_until[key]
+            return False
+        logger.info(
+            f"Market {query_id} {side.value}: skip @{price}c, level loop "
+            f"breaker cooling this slot for another "
+            f"{until - time.time():.0f}s"
+        )
+        return True
+
     def _cancel_ask(
         self,
         context: MarketContext,
@@ -2195,6 +2298,40 @@ class AvellanedaMarketMaker:
                 return None
 
         current_order = order_mgr.get_current_order(outcome, side, level_idx)
+
+        # Slot-collision guard: the chain keys orders by (wallet, outcome,
+        # signed price), so acting at a price another level is tracked at
+        # would move/clobber THAT level's on-chain order and leave its
+        # tracking stale -- its next change hits "Old order not found",
+        # clears, re-places, and the two levels loop (Eggs 72c, 09-09).
+        # Skip this level for the cycle; the grid separates as pricing moves.
+        owner_lvl = order_mgr.level_owning_price(
+            outcome, side, new_price, level_idx
+        )
+        skip_key = (context.query_id, outcome, side == Side.BID, level_idx)
+        if owner_lvl is not None:
+            skips = self._slot_guard_skips.get(skip_key, 0) + 1
+            self._slot_guard_skips[skip_key] = skips
+            if skips % SLOT_GUARD_STALL_ERROR_EVERY == 0:
+                logger.error(
+                    f"SLOT GUARD STALL: market {context.query_id} "
+                    f"{side.value} L{level_idx} has skipped {skips} "
+                    f"consecutive cycles (target @{new_price}c owned by "
+                    f"L{owner_lvl}); level tracking may be wedged"
+                )
+            else:
+                logger.info(
+                    f"Market {context.query_id} {side.value} L{level_idx}: "
+                    f"skip @{new_price}c, slot owned by L{owner_lvl} (chain "
+                    f"keys orders by price; acting would corrupt that level)"
+                )
+            return None
+        self._slot_guard_skips.pop(skip_key, None)
+
+        # Level loop breaker: a slot that recently cleared "order not found"
+        # repeatedly is in a placement/clear loop; stop feeding it.
+        if self._level_slot_cooling(context.query_id, outcome, side, new_price):
+            return None
 
         if self.config.dry_run:
             logger.info(
@@ -2475,11 +2612,16 @@ class AvellanedaMarketMaker:
                 raise MarketSettledError(context.query_id) from e
 
             # Clear stale order state so next cycle places a fresh order
-            # instead of retrying a failed update forever.
+            # instead of retrying a failed update forever. level_idx is
+            # load-bearing: without it clear_order defaults to level 0, so
+            # an L1+ not-found wiped L0's LIVE tracking (invisible resting
+            # order, double placement) while L1's stale entry retried the
+            # dead change_bid every cycle, keyed by its old price where the
+            # loop breaker (which gates on the NEW price) never sees it.
             if current_order is not None and (
                 "order not found" in err_str or "old order not found" in err_str
             ):
-                order_mgr.clear_order(outcome, side)
+                order_mgr.clear_order(outcome, side, level_idx)
                 self._order_state.untrack_order(
                     query_id=context.query_id,
                     outcome=outcome,
@@ -2491,6 +2633,9 @@ class AvellanedaMarketMaker:
                     f"Market {context.query_id} {side.value}: "
                     f"order not found on-chain, cleared stale state "
                     f"(was @{current_order.price}¢). Will re-place next cycle."
+                )
+                self._note_level_not_found_clear(
+                    context.query_id, outcome, side, current_order.price
                 )
                 self.stats.errors += 1
                 return None
@@ -2515,6 +2660,45 @@ class AvellanedaMarketMaker:
         mode — accepting the small state-vs-chain divergence is strictly
         better than the SIGKILL alternative.
         """
+        # Settled market: settlement REMOVES resting orders from the book,
+        # so every cancel broadcast afterwards fails on chain (verified
+        # from the indexer, 2026-09-10 06:03 UTC Eggs settle: 148
+        # cancel_order failures, all "Order not found or does not belong
+        # to you", zero successes -- the daily post-settle alert wave).
+        # Holdings settle for value regardless; drop local tracking
+        # without touching the chain.
+        settle_time = context.config.settle_time
+        if settle_time is not None and int(time.time()) >= settle_time:
+            cleared = 0
+            for outcome in (True, False):
+                orders = context.get_orders(outcome)
+                for side, level_list in (
+                    (Side.BID, orders.bids),
+                    (Side.ASK, orders.asks),
+                ):
+                    for lvl_idx, order in enumerate(level_list):
+                        if order is None:
+                            continue
+                        if side == Side.BID:
+                            orders.set_bid(lvl_idx, None)
+                        else:
+                            orders.set_ask(lvl_idx, None)
+                        self._order_state.untrack_order(
+                            query_id=context.query_id,
+                            outcome=outcome,
+                            is_buy=(side == Side.BID),
+                            price=order.price,
+                            level_idx=lvl_idx,
+                        )
+                        cleared += 1
+            if cleared:
+                logger.info(
+                    f"Market {context.query_id} already settled "
+                    f"(settle_time={settle_time}); dropped {cleared} tracked "
+                    f"orders locally, no cancels broadcast"
+                )
+            return
+
         for outcome in [True, False]:
             orders = context.get_orders(outcome)
 
@@ -2998,6 +3182,13 @@ class AvellanedaMarketMaker:
             return
 
         for context in self._markets.values():
+            # Same settled-market rule as _cancel_market_orders: the chain
+            # rejects every cancel past settle_time, so broadcasting them
+            # is failed-tx noise. Latent today (all live configs run
+            # execution_timeframe_mode "infinite") but guarded for parity.
+            settle_time = context.config.settle_time
+            if settle_time is not None and int(time.time()) >= settle_time:
+                continue
             for outcome in [True, False]:
                 orders = context.get_orders(outcome)
 

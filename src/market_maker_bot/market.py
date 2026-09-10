@@ -322,6 +322,31 @@ class OrderManager:
         orders = self.context.get_orders(outcome)
         return orders.get_bid(level_idx) if side == Side.BID else orders.get_ask(level_idx)
 
+    def level_owning_price(
+        self, outcome: bool, side: Side, price: int, exclude_level: int
+    ) -> Optional[int]:
+        """Return the index of another level tracked at ``price`` for
+        (outcome, side), or None if the price slot is free.
+
+        The chain keys resting orders by (wallet, outcome, signed price)
+        while the bot tracks them per level_idx, so two levels acting on
+        the same price corrupt each other: one level's change moves the
+        on-chain order out from under the other, whose next change hits
+        "Old order not found", clears its state, and re-places at the
+        same price -- a tight loop (Eggs 72c storm, 2026-09-09).
+        _create_order_levels dedupes proposals within one cycle, but a
+        grid shift across cycles can still land one level's NEW price on
+        another level's CURRENT price; callers must skip that update.
+        """
+        orders = self.context.get_orders(outcome)
+        level_list = orders.bids if side == Side.BID else orders.asks
+        for idx, order in enumerate(level_list):
+            if idx == exclude_level or order is None:
+                continue
+            if order.price == price:
+                return idx
+        return None
+
 
 def convert_price_for_order(price: int, side: Side) -> int:
     """
