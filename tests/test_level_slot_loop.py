@@ -23,7 +23,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from market_maker_bot.bot import AvellanedaMarketMaker
+from market_maker_bot.bot import AvellanedaMarketMaker, _pair_out_of_order
 from market_maker_bot.market import OrderManager, Side
 from market_maker_bot.models import ActiveOrders
 
@@ -75,9 +75,10 @@ def _quote_bot(threshold=3, window=120.0, cooldown=300.0):
     return bot
 
 
-def _update(bot, ctx, mgr, price, amount=10, level_idx=0, outcome=True):
+def _update(bot, ctx, mgr, price, amount=10, level_idx=0, outcome=True,
+            side=Side.BID):
     return AvellanedaMarketMaker._update_single_order(
-        bot, ctx, outcome, Side.BID, price, amount, mgr, level_idx
+        bot, ctx, outcome, side, price, amount, mgr, level_idx
     )
 
 
@@ -422,3 +423,99 @@ def test_startup_recovery_keeps_distinct_prices():
     recovered = [o for o in ctx.yes_orders.bids if o is not None]
     assert sorted(o.price for o in recovered) == [71, 72]
     bot._order_state.untrack_order.assert_not_called()
+
+
+# --- level-inversion healer (2026-09-15: 17 mag7 ask pairs wedged) -----------
+
+def test_pair_out_of_order_semantics():
+    # Asks ascend with level; bids descend; equal prices are ordered.
+    assert _pair_out_of_order(Side.ASK, 0, 85, 1, 84)
+    assert not _pair_out_of_order(Side.ASK, 0, 84, 1, 85)
+    assert _pair_out_of_order(Side.BID, 0, 70, 1, 72)
+    assert not _pair_out_of_order(Side.BID, 0, 73, 1, 72)
+    assert not _pair_out_of_order(Side.ASK, 0, 84, 1, 84)
+    # Argument order must not matter.
+    assert _pair_out_of_order(Side.ASK, 1, 84, 0, 85)
+
+
+def test_ask_inversion_heals_with_zero_chain_writes():
+    """The 09-15 wedge: asks tracked L0@85 / L1@84, pricing wants L0@84 /
+    L1@85. The healer swaps the labels locally and quoting resumes."""
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.ASK, 85, 7, "txA", level_idx=0)
+    mgr.record_order(True, Side.ASK, 84, 9, "txB", level_idx=1)
+    assert _update(bot, ctx, mgr, 84, level_idx=0, side=Side.ASK) is None
+    # Labels swapped: records (price, amount, tx) travel intact.
+    a0, a1 = ctx.yes_orders.get_ask(0), ctx.yes_orders.get_ask(1)
+    assert (a0.price, a0.amount, a0.tx_hash) == (84, 9, "txB")
+    assert (a1.price, a1.amount, a1.tx_hash) == (85, 7, "txA")
+    # Persistent state re-labeled the same way.
+    assert bot._order_state.untrack_order.call_count == 2
+    tracked = [c[1] for c in bot._order_state.track_order.call_args_list]
+    assert {(t["price"], t["level_idx"]) for t in tracked} == {(84, 0), (85, 1)}
+    # Zero chain writes.
+    bot._cancel_ask.assert_not_called()
+    bot._place_ask.assert_not_called()
+    bot._client.change_bid.assert_not_called()
+    # Next cycle both levels are consistent: no update needed, still no writes.
+    _update(bot, ctx, mgr, 84, level_idx=0, side=Side.ASK)
+    _update(bot, ctx, mgr, 85, level_idx=1, side=Side.ASK)
+    bot._cancel_ask.assert_not_called()
+    bot._place_ask.assert_not_called()
+
+
+def test_bid_inversion_heals():
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.BID, 70, 10, "tx0", level_idx=0)
+    mgr.record_order(True, Side.BID, 72, 10, "tx1", level_idx=1)
+    assert _update(bot, ctx, mgr, 72, level_idx=0) is None
+    assert ctx.yes_orders.get_bid(0).price == 72
+    assert ctx.yes_orders.get_bid(1).price == 70
+    bot._client.change_bid.assert_not_called()
+    bot._client.place_buy_order.assert_not_called()
+
+
+def test_ordered_pair_is_never_relabeled():
+    """The normal transient grid shift (correctly ordered pair) must keep
+    the plain skip behavior - no swap, no state writes."""
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.BID, 73, 10, "tx0", level_idx=0)
+    mgr.record_order(True, Side.BID, 72, 10, "tx1", level_idx=1)
+    assert _update(bot, ctx, mgr, 72, level_idx=0) is None
+    assert ctx.yes_orders.get_bid(0).price == 73
+    assert ctx.yes_orders.get_bid(1).price == 72
+    bot._order_state.track_order.assert_not_called()
+    assert bot._slot_guard_skips[(7, True, True, 0)] == 1
+
+
+def test_untracked_level_targeting_owned_slot_does_not_relabel():
+    """A level with NO current order proposing an occupied price is the
+    place-collision case, not an inversion: plain skip."""
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.ASK, 84, 9, "txB", level_idx=1)
+    assert _update(bot, ctx, mgr, 84, level_idx=0, side=Side.ASK) is None
+    assert ctx.yes_orders.get_ask(1).price == 84
+    bot._order_state.track_order.assert_not_called()
+
+
+def test_three_level_cycle_sorts_pairwise():
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.ASK, 97, 5, "t0", level_idx=0)
+    mgr.record_order(True, Side.ASK, 99, 5, "t1", level_idx=1)
+    mgr.record_order(True, Side.ASK, 98, 5, "t2", level_idx=2)
+    # L1 targets 98 (owned by L2); pair (L1@99, L2@98) is out of order.
+    assert _update(bot, ctx, mgr, 98, level_idx=1, side=Side.ASK) is None
+    prices = [ctx.yes_orders.get_ask(i).price for i in range(3)]
+    assert prices == [97, 98, 99]
+    bot._cancel_ask.assert_not_called()
+    bot._place_ask.assert_not_called()

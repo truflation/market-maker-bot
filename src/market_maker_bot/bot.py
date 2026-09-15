@@ -126,6 +126,21 @@ def _compute_base_amount(market_config, price_cents: int) -> int:
     return market_config.order_amount
 
 
+def _pair_out_of_order(
+    side: "Side", lvl_a: int, price_a: int, lvl_b: int, price_b: int
+) -> bool:
+    """True if two tracked levels violate the grid's ordering invariant:
+    ask prices ascend with level index, bid prices descend (level 0 is the
+    tightest quote on both sides). Equal prices are never out of order."""
+    if lvl_a == lvl_b:
+        return False
+    if lvl_a > lvl_b:
+        lvl_a, price_a, lvl_b, price_b = lvl_b, price_b, lvl_a, price_a
+    if side == Side.ASK:
+        return price_a > price_b
+    return price_a < price_b
+
+
 class MarketSettledError(Exception):
     """Raised when an operation targets a market that has already settled."""
     def __init__(self, query_id: int):
@@ -2310,6 +2325,60 @@ class AvellanedaMarketMaker:
         )
         skip_key = (context.query_id, outcome, side == Side.BID, level_idx)
         if owner_lvl is not None:
+            # Level-inversion healer: when this level's target price is the
+            # OWNER's tracked price and the pair is tracked strictly out of
+            # order (asks must ascend with level, bids descend), the labels
+            # are swapped relative to what pricing wants and the guard would
+            # block both directions forever (observed: 17 mag7 ask pairs
+            # wedged for days, 2026-09-15). Levels are bot-local bookkeeping
+            # - the chain keys orders by price - so exchanging the two
+            # records heals the wedge with zero chain writes. A correctly
+            # ordered pair (the normal transient grid shift) is never
+            # touched, and a swap strictly sorts the pair so it cannot
+            # flap; longer cycles sort pairwise over successive passes.
+            owner_order = order_mgr.get_current_order(outcome, side, owner_lvl)
+            if (
+                current_order is not None
+                and owner_order is not None
+                and _pair_out_of_order(
+                    side, level_idx, current_order.price,
+                    owner_lvl, owner_order.price,
+                )
+            ):
+                order_mgr.swap_levels(outcome, side, level_idx, owner_lvl)
+                is_buy = side == Side.BID
+                self._order_state.untrack_order(
+                    context.query_id, outcome, is_buy,
+                    current_order.price, level_idx,
+                )
+                self._order_state.untrack_order(
+                    context.query_id, outcome, is_buy,
+                    owner_order.price, owner_lvl,
+                )
+                self._order_state.track_order(
+                    query_id=context.query_id, outcome=outcome, is_buy=is_buy,
+                    price=owner_order.price, amount=owner_order.amount,
+                    order_id=owner_order.tx_hash, level_idx=level_idx,
+                    is_inventory_backed=owner_order.is_inventory_backed,
+                )
+                self._order_state.track_order(
+                    query_id=context.query_id, outcome=outcome, is_buy=is_buy,
+                    price=current_order.price, amount=current_order.amount,
+                    order_id=current_order.tx_hash, level_idx=owner_lvl,
+                    is_inventory_backed=current_order.is_inventory_backed,
+                )
+                self._slot_guard_skips.pop(skip_key, None)
+                self._slot_guard_skips.pop(
+                    (context.query_id, outcome, is_buy, owner_lvl), None
+                )
+                logger.warning(
+                    f"LEVEL RELABEL: market {context.query_id} {side.value} "
+                    f"L{level_idx}@{current_order.price}c <-> "
+                    f"L{owner_lvl}@{owner_order.price}c were tracked out of "
+                    f"order; swapped labels locally (no chain action). "
+                    f"Quoting resumes next cycle."
+                )
+                return None
             skips = self._slot_guard_skips.get(skip_key, 0) + 1
             self._slot_guard_skips[skip_key] = skips
             if skips % SLOT_GUARD_STALL_ERROR_EVERY == 0:
