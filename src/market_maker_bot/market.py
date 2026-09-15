@@ -322,6 +322,25 @@ class OrderManager:
         orders = self.context.get_orders(outcome)
         return orders.get_bid(level_idx) if side == Side.BID else orders.get_ask(level_idx)
 
+    def swap_levels(
+        self, outcome: bool, side: Side, lvl_a: int, lvl_b: int
+    ) -> None:
+        """Exchange the tracked orders of two levels. Pure bookkeeping: the
+        chain keys orders by price and knows nothing of level indices, so a
+        relabel never touches the book. Used to heal level inversions (a
+        pair tracked in the wrong order wedges under the slot-collision
+        guard: each level's target is the other's tracked price, and both
+        skip forever - observed on 17 mag7 ask pairs, 2026-09-15)."""
+        orders = self.context.get_orders(outcome)
+        if side == Side.BID:
+            a, b = orders.get_bid(lvl_a), orders.get_bid(lvl_b)
+            orders.set_bid(lvl_a, b)
+            orders.set_bid(lvl_b, a)
+        else:
+            a, b = orders.get_ask(lvl_a), orders.get_ask(lvl_b)
+            orders.set_ask(lvl_a, b)
+            orders.set_ask(lvl_b, a)
+
     def level_owning_price(
         self, outcome: bool, side: Side, price: int, exclude_level: int
     ) -> Optional[int]:
