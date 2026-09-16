@@ -519,3 +519,42 @@ def test_three_level_cycle_sorts_pairwise():
     assert prices == [97, 98, 99]
     bot._cancel_ask.assert_not_called()
     bot._place_ask.assert_not_called()
+
+
+# --- benign hold vs real stall (2026-09-16, market 787 saturated grid) -------
+
+def test_benign_hold_never_logs_error(caplog):
+    """A level WITH a resting quote whose target is quoted by its neighbor
+    is a covered book, not a wedge: no ERROR escalation at the threshold."""
+    import logging
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.ASK, 97, 5, "t0", level_idx=0)
+    mgr.record_order(True, Side.ASK, 98, 5, "t1", level_idx=1)
+    with caplog.at_level(logging.INFO):
+        for _ in range(300):
+            assert _update(bot, ctx, mgr, 98, level_idx=0, side=Side.ASK) is None
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert any("SLOT GUARD HOLD" in r.message for r in caplog.records)
+    # Nothing moved and nothing was broadcast.
+    assert ctx.yes_orders.get_ask(0).price == 97
+    bot._cancel_ask.assert_not_called()
+    bot._place_ask.assert_not_called()
+
+
+def test_placement_blocked_still_escalates_to_error(caplog):
+    """A level with NO resting quote blocked from placing means the book is
+    thinner than designed: the ERROR escalation must survive."""
+    import logging
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.BID, 72, 10, "tx1", level_idx=1)
+    with caplog.at_level(logging.INFO):
+        for _ in range(150):
+            assert _update(bot, ctx, mgr, 72, level_idx=0) is None
+    assert any(
+        r.levelno == logging.ERROR and "SLOT GUARD STALL" in r.message
+        for r in caplog.records
+    )
