@@ -2381,12 +2381,39 @@ class AvellanedaMarketMaker:
                 return None
             skips = self._slot_guard_skips.get(skip_key, 0) + 1
             self._slot_guard_skips[skip_key] = skips
-            if skips % SLOT_GUARD_STALL_ERROR_EVERY == 0:
+            # Benign hold vs real stall. When this level HAS a resting quote
+            # and the pair is correctly ordered, the blocked target is
+            # already quoted by the neighbor and our own quote rests
+            # consistently beside it: the book covers the proposed grid,
+            # nothing is broken. A saturated grid near the 1c/99c caps parks
+            # here for hours (market 787 asks resting 97/98/99 vs proposals
+            # 98/99, 2026-09-16) - that must not page. The ERROR escalation
+            # is reserved for a level that cannot PLACE at all (no resting
+            # quote, book thinner than designed) or a state the inversion
+            # healer above did not recognize.
+            benign_hold = current_order is not None
+            if benign_hold:
+                if skips % SLOT_GUARD_STALL_ERROR_EVERY == 0:
+                    logger.info(
+                        f"SLOT GUARD HOLD: market {context.query_id} "
+                        f"{side.value} L{level_idx} holding @"
+                        f"{current_order.price}c for {skips} cycles (target "
+                        f"@{new_price}c already quoted by L{owner_lvl}; book "
+                        f"covers the proposed grid)"
+                    )
+                else:
+                    logger.debug(
+                        f"Market {context.query_id} {side.value} "
+                        f"L{level_idx}: hold @{current_order.price}c, target "
+                        f"@{new_price}c quoted by L{owner_lvl}"
+                    )
+            elif skips % SLOT_GUARD_STALL_ERROR_EVERY == 0:
                 logger.error(
                     f"SLOT GUARD STALL: market {context.query_id} "
                     f"{side.value} L{level_idx} has skipped {skips} "
-                    f"consecutive cycles (target @{new_price}c owned by "
-                    f"L{owner_lvl}); level tracking may be wedged"
+                    f"consecutive cycles and has NO resting quote (target "
+                    f"@{new_price}c owned by L{owner_lvl}); the book is "
+                    f"thinner than designed"
                 )
             else:
                 logger.info(
