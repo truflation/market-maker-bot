@@ -558,3 +558,22 @@ def test_placement_blocked_still_escalates_to_error(caplog):
         r.levelno == logging.ERROR and "SLOT GUARD STALL" in r.message
         for r in caplog.records
     )
+
+
+# --- reconcile skips the pre-settlement cutoff window (2026-09-22) -----------
+
+def test_reconcile_skips_market_inside_cutoff():
+    """The pull empties a market by design; reconcile orphan-hunting there
+    double-cancels the same orders (~60-90 failed txs per daily settle)."""
+    bot = _reconcile_bot(settle_time=int(time.time()) + 900)  # 15 min out
+    bot.config.pre_settlement_cutoff = 1800.0
+    AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+    bot._client.get_order_book.assert_not_called()
+    bot._client.cancel_order.assert_not_called()
+
+
+def test_reconcile_runs_outside_cutoff():
+    bot = _reconcile_bot(settle_time=int(time.time()) + 7200)  # 2h out
+    bot.config.pre_settlement_cutoff = 1800.0
+    AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+    assert bot._client.get_order_book.call_count == 2
