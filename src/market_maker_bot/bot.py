@@ -995,8 +995,17 @@ class AvellanedaMarketMaker:
             # for up to one roller tick): its book is gone or frozen, orphan
             # cancels against it are guaranteed failed txs, and the budget
             # has nothing left to true up. Skip entirely.
+            # ALSO skip the PRE-SETTLEMENT CUTOFF window: the pull empties
+            # the market by design with wait=False cancels and untracks
+            # unconditionally, so a reconcile pass that reads the book
+            # before those cancels confirm sees every resting order as an
+            # orphan and double-cancels it - ~60-90 guaranteed not-found
+            # failed txs around every daily ladder settle (the recurring
+            # ~05:30-06:30 Eggs alert pages, 2026-09-22 diagnosis).
             settle_ts_mkt = context.config.settle_time
-            if settle_ts_mkt is not None and time.time() >= settle_ts_mkt:
+            if settle_ts_mkt is not None and time.time() >= (
+                settle_ts_mkt - self.config.pre_settlement_cutoff
+            ):
                 continue
             bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
             asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
