@@ -87,9 +87,8 @@ class BotOrder:
     tx_hash: Optional[str] = None
     created_at: float = 0.0  # Unix timestamp
     # True iff this ASK was placed via place_sell_order against held inventory
-    # (single on-chain leg). False covers BIDs and legacy split-mint ASKs
-    # (retired 2026-09-24; only the tracked slot can still rest). Drives the
-    # cancel path.
+    # (single on-chain leg). False covers BIDs and split-mint ASKs (two legs:
+    # the auto-listed pair + the explicit YES sell). Drives the cancel path.
     is_inventory_backed: bool = False
 
 

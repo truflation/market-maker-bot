@@ -91,8 +91,7 @@ def test_not_found_beats_stale_book_recheck_on_split_legs():
     _cancel_ask(bot, is_inventory_backed=False)  # must not raise
 
     bot._leg_still_on_book.assert_not_called()
-    # Legacy split asks cancel only the YES sell leg (2026-09-24).
-    assert len(bot._cancel_not_found_times) == 1
+    assert len(bot._cancel_not_found_times) == 2  # both split legs
 
 
 def test_not_found_storm_exits_for_restart():
