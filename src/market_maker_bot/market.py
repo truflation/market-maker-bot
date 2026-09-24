@@ -282,8 +282,8 @@ class OrderManager:
             tx_hash: Transaction hash
             level_idx: Order level index
             is_inventory_backed: True iff sell was placed against held shares
-                via place_sell_order (single leg). False for split-mint sells
-                and all bids.
+                via place_sell_order (single leg). False for legacy split-mint
+                sells and all bids.
 
         Returns:
             Created BotOrder
