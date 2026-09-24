@@ -1428,8 +1428,9 @@ class AvellanedaMarketMaker:
             return
 
         try:
+            as_of = time.time()
             positions = self._client.get_user_positions()
-            self._inventory.update_from_user_positions(positions)
+            self._inventory.update_from_user_positions(positions, as_of=as_of)
             self._last_inventory_refresh = time.time()
             logger.debug(f"Refreshed inventory from {len(positions)} positions")
         except Exception as e:
@@ -1911,6 +1912,33 @@ class AvellanedaMarketMaker:
 
         context.last_order_refresh = time.time()
 
+    def _free_to_sell(
+        self,
+        context: MarketContext,
+        outcome: bool,
+        assume_cancelled=None,
+    ) -> int:
+        """Shares free to back a new inventory-backed ask on `outcome`: the
+        last inventory refresh plus the bot's tracked inventory-backed asks
+        (see MarketInventory.free_to_sell). `assume_cancelled` is a tracked
+        BotOrder to leave out, as if already cancelled; its shares count
+        again only once a refresh sees them held.
+
+        Replaced available_for_sell() (held - reserved), which subtracted
+        every listed ask twice (held already excludes listed sells) and kept
+        a filled ask's reservation until restart. On 2026-09-24 it showed 10
+        free shares on a market holding 21, pushing asks onto the retired
+        split-mint fallback."""
+        inv = self._inventory.get_market_inventory(context.query_id)
+        tracked = [
+            (order.price, order.amount, order.created_at)
+            for order in context.get_orders(outcome).asks
+            if order is not None
+            and order.is_inventory_backed
+            and order is not assume_cancelled
+        ]
+        return inv.free_to_sell(outcome, tracked)
+
     def _place_ask(
         self,
         context: MarketContext,
@@ -1942,7 +1970,7 @@ class AvellanedaMarketMaker:
         real book as it was and stops the wasted and failed transactions.
         """
         inv = self._inventory.get_market_inventory(context.query_id)
-        available = inv.available_for_sell(outcome)
+        available = self._free_to_sell(context, outcome)
 
         if available >= amount and _meets_min_notional(new_price, amount):
             try:
@@ -1958,6 +1986,12 @@ class AvellanedaMarketMaker:
                     f"Inventory-backed sell failed (qid={context.query_id} "
                     f"outcome={'YES' if outcome else 'NO'} {new_price}c x{amount}): {e}"
                 )
+                if not self._is_definitive_rejection(e):
+                    # It may still land: keep its shares out of the free
+                    # count until a refresh shows the truth.
+                    inv.note_unconfirmed_sell(
+                        outcome, new_price, amount, time.time()
+                    )
                 raise
             inv.reserve_pair(outcome, amount)
             logger.info(
@@ -2477,19 +2511,13 @@ class AvellanedaMarketMaker:
                     # Pre-check: can the inventory path place this ask at
                     # all? If not, keep the old ask only while it is no more
                     # aggressive than the target; otherwise pull it.
-                    inv_for_check = self._inventory.get_market_inventory(context.query_id)
-                    avail = inv_for_check.available_for_sell(outcome)
-                    # If the OLD ask was inventory-backed, its amount is
-                    # currently locked in reservations; we'd release it on
-                    # cancel and that capacity would be available to the new
-                    # ask. Account for that here so we don't false-negative.
-                    old_inv_release = (
-                        current_order.amount
-                        if current_order.is_inventory_backed
-                        else 0
+                    # Count the old ask as cancelled: its shares back the
+                    # new one.
+                    avail = self._free_to_sell(
+                        context, outcome, assume_cancelled=current_order
                     )
                     will_inv = (
-                        (avail + old_inv_release) >= amount
+                        avail >= amount
                         and _meets_min_notional(new_price, amount)
                     )
                     if not will_inv:
@@ -2543,6 +2571,16 @@ class AvellanedaMarketMaker:
                         price=current_order.price,
                         amount=current_order.amount,
                         is_inventory_backed=current_order.is_inventory_backed,
+                    )
+                    # The old ask is gone: stop tracking it before sizing
+                    # the new one against free shares.
+                    order_mgr.clear_order(outcome, side, level_idx)
+                    self._order_state.untrack_order(
+                        query_id=context.query_id,
+                        outcome=outcome,
+                        is_buy=False,
+                        price=current_order.price,
+                        level_idx=level_idx,
                     )
                     tx_hash, is_inv_backed = self._place_ask(
                         context=context,

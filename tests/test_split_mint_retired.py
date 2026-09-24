@@ -69,6 +69,7 @@ def _bot(inv):
     bot._cancel_not_found_times = deque()
     bot._inventory.get_market_inventory.return_value = inv
     for name in (
+        "_free_to_sell",
         "_place_ask",
         "_cancel_ask",
         "_level_slot_cooling",
@@ -120,8 +121,10 @@ def _refresh(bot, ctx, old_price, new_price, old_amount=3, new_amount=6,
 
 
 def _short_inv():
-    # Only 3 shares would be free after cancelling the old x3 ask.
+    # Nothing held; the old x3 ask (at 38c or 40c in these tests) is listed,
+    # so only its 3 shares would be free after cancelling it.
     inv = _inv(yes=0, no=0)
+    inv.listed_by_price = {(True, 38): 3, (True, 40): 3}
     inv.reserve_pair(True, 3)
     return inv
 

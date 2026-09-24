@@ -12,6 +12,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# How long a sell that failed without proof it never rested stays out of the
+# free count unless a read shows it listed: covers the write-confirm timeout
+# plus the longest a blocked write pool can still broadcast (900s).
+UNCONFIRMED_SELL_TTL_S = 900.0
+
 
 @dataclass
 class MarketInventory:
@@ -55,8 +60,20 @@ class MarketInventory:
     chain_listed_yes_sells: int = 0
     chain_listed_no_sells: int = 0
 
+    # The same listed sells keyed by (outcome, price), the time the last
+    # refresh's read started, and sells whose outcome is unknown (a timeout
+    # may still land), as (outcome, price, amount, noted_at). With the bot's
+    # tracked asks these give free_to_sell() without double-counting listed
+    # shares.
+    listed_by_price: dict = field(default_factory=dict)
+    refreshed_at: float = 0.0
+    unconfirmed_sells: list = field(default_factory=list)
+
     def reserve_pair(self, outcome: bool, n: int) -> None:
-        """Reserve n shares for an inventory-backed ASK. outcome=True debits
+        """Vestigial: asks are sized by free_to_sell(), not by these
+        counters or available_for_sell(); kept for logs and old callers.
+
+        Reserve n shares for an inventory-backed ASK. outcome=True debits
         from YES side, outcome=False from NO side. No-op if n <= 0."""
         if n <= 0:
             return
@@ -83,6 +100,47 @@ class MarketInventory:
         reserved = self.reserved_yes_sells if outcome else self.reserved_no_sells
         return max(0, held - reserved)
 
+    def note_unconfirmed_sell(
+        self, outcome: bool, price: int, n: int, noted_at: float
+    ) -> None:
+        """A sell whose placement failed without proof it never rested (a
+        timeout may still land, even after the next refresh). Its shares
+        stay out of the free count until a read shows it listed or
+        UNCONFIRMED_SELL_TTL_S passes."""
+        if n > 0:
+            self.unconfirmed_sells.append((outcome, price, n, noted_at))
+
+    def free_to_sell(self, outcome: bool, tracked_asks: list) -> int:
+        """Shares free to back a new inventory-backed ASK on `outcome`.
+
+        `tracked_asks` is (price, amount, created_at) for each of the bot's
+        inventory-backed asks on this outcome. Held shares (price=0
+        positions) already exclude every listed sell, so:
+
+        - an ask placed before the last refresh's read reduces the count
+          only by the part that read did not see listed at its price (a
+          stale read, or a partial fill);
+        - an ask placed since reduces it in full, even if some other order
+          of ours rests at the same price (the chain keeps one order per
+          price, so the read cannot tell them apart).
+
+        Every unknown rounds down. A cancelled ask's shares come back only
+        with the next refresh; listings the bot does not track (legacy or
+        orphan orders) are neither added nor subtracted.
+        """
+        held = self.yes_shares if outcome else self.no_shares
+        seen: dict = {}
+        pending = sum(n for o, _, n, _ in self.unconfirmed_sells if o == outcome)
+        for price, amount, created_at in tracked_asks:
+            if created_at >= self.refreshed_at:
+                pending += amount
+            else:
+                seen[price] = seen.get(price, 0) + amount
+        for price, amount in seen.items():
+            listed = self.listed_by_price.get((outcome, price), 0)
+            pending += max(0, amount - listed)
+        return max(0, held - pending)
+
     def paired_inventory(self) -> int:
         """Number of fully-paired (1 YES + 1 NO) units we own on this market,
         including shares currently listed as sell orders (whose underlying
@@ -105,6 +163,8 @@ class MarketInventory:
         no_bid_collateral: Decimal = Decimal("0"),
         chain_listed_yes_sells: int = 0,
         chain_listed_no_sells: int = 0,
+        listed_by_price: Optional[dict] = None,
+        refreshed_at: float = 0.0,
     ) -> None:
         """
         Update inventory from position data. NOTE: held + listed totals
@@ -129,6 +189,16 @@ class MarketInventory:
         self.usd_locked_no_bids = no_bid_collateral
         self.chain_listed_yes_sells = chain_listed_yes_sells
         self.chain_listed_no_sells = chain_listed_no_sells
+        self.listed_by_price = dict(listed_by_price or {})
+        self.refreshed_at = refreshed_at
+        # Drop an unconfirmed sell once this read shows it listed (it landed
+        # and held already excludes it) or once it is too old to still land.
+        self.unconfirmed_sells = [
+            (o, price, n, noted_at)
+            for o, price, n, noted_at in self.unconfirmed_sells
+            if self.listed_by_price.get((o, price), 0) < n
+            and refreshed_at - noted_at < UNCONFIRMED_SELL_TTL_S
+        ]
 
     def get_share_value(self, outcome: bool, mid_price: float) -> Decimal:
         """
@@ -278,13 +348,17 @@ class InventoryManager:
             )
         return self._inventories[query_id]
 
-    def update_from_user_positions(self, positions: list[dict]) -> None:
+    def update_from_user_positions(
+        self, positions: list[dict], as_of: float = 0.0
+    ) -> None:
         """
         Update all inventories from user positions data.
 
         Args:
             positions: List of position dicts from TNClient.get_user_positions()
                       Each has: query_id, outcome, price, amount
+            as_of: Time the read started. Orders placed from then on are
+                      not assumed visible in it.
         """
         # Group by market
         by_market: dict[int, dict[str, int]] = {}
@@ -303,6 +377,7 @@ class InventoryManager:
                     "no_bid_value": 0,
                     "yes_listed_sells": 0,
                     "no_listed_sells": 0,
+                    "listed_by_price": {},
                 }
 
             # Signed-price convention from get_user_positions:
@@ -329,6 +404,23 @@ class InventoryManager:
                     by_market[query_id]["yes_listed_sells"] += amount
                 else:
                     by_market[query_id]["no_listed_sells"] += amount
+                listed = by_market[query_id]["listed_by_price"]
+                key = (bool(outcome), int(price))
+                listed[key] = listed.get(key, 0) + amount
+
+        # A market with no positions at all holds nothing: reset it rather
+        # than keep the last read's shares.
+        for query_id in self._inventories:
+            if query_id not in by_market:
+                by_market[query_id] = {
+                    "yes_shares": 0,
+                    "no_shares": 0,
+                    "yes_bid_value": 0,
+                    "no_bid_value": 0,
+                    "yes_listed_sells": 0,
+                    "no_listed_sells": 0,
+                    "listed_by_price": {},
+                }
 
         # Update each market's inventory
         for query_id, data in by_market.items():
@@ -340,6 +432,8 @@ class InventoryManager:
                 no_bid_collateral=Decimal(str(data["no_bid_value"] / 100)),
                 chain_listed_yes_sells=data["yes_listed_sells"],
                 chain_listed_no_sells=data["no_listed_sells"],
+                listed_by_price=data["listed_by_price"],
+                refreshed_at=as_of,
             )
 
         logger.debug(f"Updated inventory for {len(by_market)} markets")
