@@ -210,3 +210,68 @@ def test_legacy_cancel_error_raises_only_while_leg_still_rests():
         pass
     else:
         raise AssertionError("expected RuntimeError while the leg rests")
+
+
+NOT_FOUND = Exception("ERROR: Order not found or does not belong to you")
+
+
+def test_pull_releases_the_reservation():
+    inv = _short_inv()
+    bot = _bot(inv)
+
+    _refresh(bot, _Ctx(), old_price=38, new_price=39)
+
+    assert inv.reserved_yes_sells == 0
+
+
+def test_pull_cancel_error_keeps_state_and_reservation():
+    inv = _short_inv()
+    bot = _bot(inv)
+    ctx = _Ctx()
+    bot._client.cancel_order.side_effect = Exception("gateway timeout")
+
+    assert _refresh(bot, ctx, old_price=38, new_price=39) is None
+    assert ctx.yes_orders.get_ask(0).price == 38
+    assert inv.reserved_yes_sells == 3
+    bot._order_state.untrack_order.assert_not_called()
+
+
+def test_pull_cancel_not_found_clears_and_releases_once():
+    inv = _short_inv()
+    bot = _bot(inv)
+    ctx = _Ctx()
+    bot._client.cancel_order.side_effect = NOT_FOUND
+
+    assert _refresh(bot, ctx, old_price=38, new_price=39) is None
+    assert ctx.yes_orders.get_ask(0) is None
+    assert inv.reserved_yes_sells == 0
+    assert bot._order_state.untrack_order.call_count == 1
+
+
+def test_pull_of_resting_legacy_ask_that_errors_keeps_state():
+    bot = _bot(_short_inv())
+    ctx = _Ctx()
+    bot._client.cancel_order.side_effect = Exception("gateway timeout")
+    bot._leg_still_on_book.return_value = True
+
+    _refresh(bot, ctx, old_price=40, new_price=39, inventory_backed=False)
+
+    assert ctx.yes_orders.get_ask(0).price == 40
+    bot._order_state.untrack_order.assert_not_called()
+
+
+def test_next_cycle_after_a_pull_places_nothing():
+    bot = _bot(_short_inv())
+    ctx = _Ctx()
+    mgr = OrderManager(ctx, refresh_tolerance_pct=0.0, max_order_age=1e9)
+    mgr.record_order(True, Side.ASK, 38, 3, "tx-old", level_idx=0,
+                     is_inventory_backed=True)
+
+    for _ in range(2):
+        AvellanedaMarketMaker._update_single_order(
+            bot, ctx, True, Side.ASK, 39, 6, mgr, 0
+        )
+
+    assert ctx.yes_orders.get_ask(0) is None
+    bot._client.place_sell_order.assert_not_called()
+    assert bot._client.cancel_order.call_count == 1
