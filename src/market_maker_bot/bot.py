@@ -1967,7 +1967,7 @@ class AvellanedaMarketMaker:
             )
             return tx_hash, True
 
-        logger.info(
+        logger.debug(
             f"Market {context.query_id} ask "
             f"outcome={'YES' if outcome else 'NO'} @{new_price}c x{amount}: "
             f"skip (inventory available={available})"
@@ -2134,8 +2134,8 @@ class AvellanedaMarketMaker:
         Cancel an ASK previously placed by the bot. The inventory path
         listed only the single side at the quote price. A legacy split-mint
         ask (retired 2026-09-24, may still be recovered from a state file)
-        listed two legs, but only its YES sell leg at split_price can still
-        be resting; see the comment in the split branch below.
+        listed two legs, but only its tracked slot can still be resting;
+        see the comment in the split branch below.
 
         Behavior on chain-cancel failure:
         - wait=True: propagate the exception. Caller (refresh path or
@@ -2184,14 +2184,15 @@ class AvellanedaMarketMaker:
                 # wait=False: best-effort, fall through to release.
             inv.release_pair(outcome, amount)
         else:
-            # Legacy split-mint ask recovered from state. Its auto-listed leg
-            # (NO @ 100 - split_price) was always consumed on placement,
-            # burned by the YES sell or taken by one of our NO bids, so
-            # cancelling it only produced a guaranteed "order not found"
-            # failed tx. Only the YES sell leg can still be resting.
-            split_price = price if outcome else (100 - price)
+            # Legacy split-mint ask recovered from state. Its two legs (the
+            # auto-listed NO leg and the YES sell) burned each other on
+            # placement; whatever an opposite bid of ours had taken from one
+            # leg first survives on the OTHER, which is always the tracked
+            # slot (outcome, price). Reconcile keeps a legacy record only
+            # while that slot rests, so cancel it alone: the other leg's
+            # cancel was a guaranteed "order not found" failed tx.
             any_failed = False
-            for cancel_out, cancel_p in [(True, split_price)]:
+            for cancel_out, cancel_p in [(outcome, price)]:
                 try:
                     self._client.cancel_order(
                         query_id=context.query_id,
@@ -2222,7 +2223,7 @@ class AvellanedaMarketMaker:
                         any_failed = True
             if any_failed and wait:
                 raise RuntimeError(
-                    f"split-mint cancel partially failed for "
+                    f"legacy split-mint ask cancel failed for "
                     f"qid={context.query_id} outcome={outcome} price={price}; "
                     f"orders may remain on book and reconcile will recover them"
                 )
@@ -2474,9 +2475,8 @@ class AvellanedaMarketMaker:
                         raise
                 else:
                     # Pre-check: can the inventory path place this ask at
-                    # all? If not, leave the old ask on the
-                    # book (still strictly better than an empty level until
-                    # next refresh).
+                    # all? If not, keep the old ask only while it is no more
+                    # aggressive than the target; otherwise pull it.
                     inv_for_check = self._inventory.get_market_inventory(context.query_id)
                     avail = inv_for_check.available_for_sell(outcome)
                     # If the OLD ask was inventory-backed, its amount is
@@ -2493,11 +2493,45 @@ class AvellanedaMarketMaker:
                         and _meets_min_notional(new_price, amount)
                     )
                     if not will_inv:
+                        # An inventory-backed ask priced at or above the
+                        # target stays: it cannot sit below our re-priced bid
+                        # or be lifted cheap. A cheaper one would, and a
+                        # legacy split-mint ask can never be re-placed (its
+                        # shares are locked in the listing), so pull those
+                        # and leave the level empty until inventory allows.
+                        if (
+                            current_order.is_inventory_backed
+                            and current_order.price >= new_price
+                        ):
+                            logger.debug(
+                                f"Market {context.query_id} {side.value} "
+                                f"L{level_idx} outcome="
+                                f"{'YES' if outcome else 'NO'}: skip refresh "
+                                f"(inventory cannot place {new_price}c "
+                                f"x{amount}; avail={avail}). Keeping old "
+                                f"@{current_order.price}c."
+                            )
+                            return None
+                        self._cancel_ask(
+                            context=context,
+                            outcome=outcome,
+                            price=current_order.price,
+                            amount=current_order.amount,
+                            is_inventory_backed=current_order.is_inventory_backed,
+                        )
+                        order_mgr.clear_order(outcome, side, level_idx)
+                        self._order_state.untrack_order(
+                            query_id=context.query_id,
+                            outcome=outcome,
+                            is_buy=False,
+                            price=current_order.price,
+                            level_idx=level_idx,
+                        )
                         logger.info(
-                            f"Market {context.query_id} {side.value} L{level_idx} "
-                            f"outcome={'YES' if outcome else 'NO'}: skip refresh "
-                            f"(inventory cannot place {new_price}c x{amount}; "
-                            f"avail={avail}). Keeping old."
+                            f"Market {context.query_id} {side.value} "
+                            f"L{level_idx} outcome={'YES' if outcome else 'NO'}: "
+                            f"pulled @{current_order.price}c (inventory cannot "
+                            f"place {new_price}c x{amount}; avail={avail})"
                         )
                         return None
 
@@ -2772,7 +2806,7 @@ class AvellanedaMarketMaker:
                     if side == Side.ASK:
                         # Branch on the recorded path: inventory-backed asks
                         # were placed as a single leg at the quote price;
-                        # split-mint asks have two on-chain orders to remove.
+                        # legacy split-mint asks take the split branch.
                         self._cancel_ask(
                             context=context,
                             outcome=outcome,
@@ -3258,9 +3292,9 @@ class AvellanedaMarketMaker:
                 for side, lvl_idx, order in all_orders:
                     try:
                         if side == Side.ASK:
-                            # Inventory-backed asks are single-leg; split-mint
-                            # asks live on both sides of the book. Branch via
-                            # the recorded flag on the BotOrder. wait=False
+                            # Inventory-backed asks and legacy split-mint asks
+                            # cancel differently. Branch via the recorded
+                            # flag on the BotOrder. wait=False
                             # because this is a bulk off-hours cancel; no new
                             # placement follows.
                             self._cancel_ask(

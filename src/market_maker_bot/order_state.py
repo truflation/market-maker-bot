@@ -29,7 +29,7 @@ class TrackedOrder:
     level_idx: int = 0  # Order level index (0 = tightest spread)
     # True iff a sell was placed via place_sell_order against existing
     # inventory (single-leg, single cancel). False covers buys and the
-    # legacy split-mint sell path (two on-chain legs, two cancels).
+    # legacy split-mint sell path (retired; cancels its tracked slot only).
     is_inventory_backed: bool = False
 
     def to_dict(self) -> dict:
@@ -41,8 +41,8 @@ class TrackedOrder:
         if "level_idx" not in data:
             data["level_idx"] = 0
         # Old state files predate the inventory-backed flag; default False
-        # treats them as legacy split-mint asks (safe — cancel-with-pass on
-        # the missing leg is already handled).
+        # treats them as legacy split-mint asks, which cancel their tracked
+        # slot like any single-leg ask.
         if "is_inventory_backed" not in data:
             data["is_inventory_backed"] = False
         return cls(**data)

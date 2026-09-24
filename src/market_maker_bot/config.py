@@ -123,14 +123,15 @@ class MarketConfig:
     # Useful for thin prediction markets where a fixed share count produces
     # very uneven dollar notionals across prices ($0.10 at 1c vs $9.90 at
     # 99c with order_amount=10). Per-leg, so each placed order is approx
-    # the same size; split-mint auto-listed legs may differ.
+    # the same size.
     order_dollar_amount: Optional[float] = None
     # When set to a positive int, on bot startup the market is brought up to
     # at least this many (YES,NO) pairs of inventory via a one-time pre-mint
     # split-mint order, after which ASK placements draw down from existing
     # inventory via place_sell_order rather than minting new pairs each time.
-    # None or 0 disables pre-mint and preserves the legacy split-mint-every-
-    # ask behavior. Idempotent across restarts (deficit only).
+    # None or 0 disables pre-mint: asks then quote only from inventory the
+    # bot already holds (e.g. from bid fills), and a market with none quotes
+    # no asks. Idempotent across restarts (deficit only).
     initial_mint_pairs: Optional[int] = None
     enabled: bool = True
 

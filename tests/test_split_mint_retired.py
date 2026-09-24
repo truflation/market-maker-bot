@@ -10,8 +10,9 @@ NO bid at 62c. The pre-settlement pull then cancelled both legs of every
 such ask and 22 cancels failed as "order not found".
 
 These tests pin the retirement: short inventory skips the ask (no mint, no
-sell), a refresh keeps the old ask rather than cancelling into an empty
-level, and legacy split records cancel only the leg that can still rest.
+sell); a refresh keeps the old ask only while it is priced at or above the
+target and otherwise pulls it; legacy split records cancel only their
+tracked slot, the one leg that can still rest.
 """
 
 from collections import deque
@@ -108,28 +109,61 @@ def test_enough_inventory_sells_one_leg():
     assert inv.reserved_yes_sells == 6
 
 
-def test_refresh_keeps_old_ask_when_inventory_is_short():
-    # Old inventory-backed ask 38c x3; the refresh wants 39c x6 but only
-    # 3 shares would be free after cancelling it. The old ask must stay.
-    inv = _inv(yes=0, no=0)
-    inv.reserve_pair(True, 3)
-    bot = _bot(inv)
-    ctx = _Ctx()
+def _refresh(bot, ctx, old_price, new_price, old_amount=3, new_amount=6,
+             inventory_backed=True):
     mgr = OrderManager(ctx, refresh_tolerance_pct=0.0, max_order_age=1e9)
-    mgr.record_order(True, Side.ASK, 38, 3, "tx-old", level_idx=0,
-                     is_inventory_backed=True)
-
-    result = AvellanedaMarketMaker._update_single_order(
-        bot, ctx, True, Side.ASK, 39, 6, mgr, 0
+    mgr.record_order(True, Side.ASK, old_price, old_amount, "tx-old",
+                     level_idx=0, is_inventory_backed=inventory_backed)
+    return AvellanedaMarketMaker._update_single_order(
+        bot, ctx, True, Side.ASK, new_price, new_amount, mgr, 0
     )
 
-    assert result is None
+
+def _short_inv():
+    # Only 3 shares would be free after cancelling the old x3 ask.
+    inv = _inv(yes=0, no=0)
+    inv.reserve_pair(True, 3)
+    return inv
+
+
+def test_refresh_keeps_old_ask_priced_at_or_above_target():
+    bot = _bot(_short_inv())
+    ctx = _Ctx()
+
+    assert _refresh(bot, ctx, old_price=40, new_price=39) is None
     bot._client.cancel_order.assert_not_called()
     bot._client.place_split_limit_order.assert_not_called()
-    assert ctx.yes_orders.get_ask(0).price == 38
+    assert ctx.yes_orders.get_ask(0).price == 40
 
 
-def test_legacy_yes_split_ask_cancels_only_the_yes_leg():
+def test_refresh_pulls_old_ask_priced_below_target():
+    # Fair moved up: a kept 38c ask would be lifted cheap or crossed by our
+    # own re-priced bid. Pull it and leave the level empty.
+    bot = _bot(_short_inv())
+    ctx = _Ctx()
+
+    assert _refresh(bot, ctx, old_price=38, new_price=39) is None
+    assert _cancels(bot) == [(True, 38)]
+    bot._client.place_sell_order.assert_not_called()
+    assert ctx.yes_orders.get_ask(0) is None
+    bot._order_state.untrack_order.assert_called_once_with(
+        query_id=5, outcome=True, is_buy=False, price=38, level_idx=0
+    )
+
+
+def test_refresh_pulls_legacy_split_ask_even_when_priced_above_target():
+    # Its shares are locked in the listing, so it could never be re-placed;
+    # keeping it would pin a stale price until settlement.
+    bot = _bot(_short_inv())
+    ctx = _Ctx()
+
+    assert _refresh(bot, ctx, old_price=40, new_price=39,
+                    inventory_backed=False) is None
+    assert _cancels(bot) == [(True, 40)]
+    assert ctx.yes_orders.get_ask(0) is None
+
+
+def test_legacy_yes_split_ask_cancels_only_its_tracked_slot():
     bot = _bot(_inv())
 
     bot._cancel_ask(context=_Ctx(), outcome=True, price=39, amount=6,
@@ -138,12 +172,41 @@ def test_legacy_yes_split_ask_cancels_only_the_yes_leg():
     assert _cancels(bot) == [(True, 39)]
 
 
-def test_legacy_no_split_ask_cancels_only_the_yes_leg():
-    # A NO split ask at 70c sold YES at 30c; its auto-listed NO@70 leg is
-    # the one that was consumed.
+def test_legacy_no_split_ask_cancels_only_its_tracked_slot():
+    # A NO split ask at 70c listed NO@70 and sold YES@30. If one of our YES
+    # bids at 30c or above took part of the YES sell, what survives the
+    # burn is NO@70, the tracked slot.
     bot = _bot(_inv())
 
     bot._cancel_ask(context=_Ctx(), outcome=False, price=70, amount=4,
                     is_inventory_backed=False, wait=False)
 
-    assert _cancels(bot) == [(True, 30)]
+    assert _cancels(bot) == [(False, 70)]
+
+
+def test_legacy_cancel_not_found_is_treated_as_cancelled():
+    bot = _bot(_inv())
+    bot._client.cancel_order.side_effect = Exception(
+        "ERROR: Order not found or does not belong to you"
+    )
+
+    bot._cancel_ask(context=_Ctx(), outcome=True, price=39, amount=6,
+                    is_inventory_backed=False, wait=True)  # must not raise
+
+
+def test_legacy_cancel_error_raises_only_while_leg_still_rests():
+    bot = _bot(_inv())
+    bot._client.cancel_order.side_effect = Exception("gateway timeout")
+
+    bot._leg_still_on_book.return_value = False
+    bot._cancel_ask(context=_Ctx(), outcome=True, price=39, amount=6,
+                    is_inventory_backed=False, wait=True)  # gone: no raise
+
+    bot._leg_still_on_book.return_value = True
+    try:
+        bot._cancel_ask(context=_Ctx(), outcome=True, price=39, amount=6,
+                        is_inventory_backed=False, wait=True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected RuntimeError while the leg rests")
