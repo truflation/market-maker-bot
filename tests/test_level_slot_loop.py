@@ -72,6 +72,8 @@ def _quote_bot(threshold=3, window=120.0, cooldown=300.0):
         AvellanedaMarketMaker._note_level_not_found_clear.__get__(bot)
     )
     bot._is_definitive_rejection.return_value = False
+    # Plenty of free shares unless a test says otherwise.
+    bot._free_to_sell.return_value = 10**9
     return bot
 
 
@@ -554,6 +556,41 @@ def test_placement_blocked_still_escalates_to_error(caplog):
     with caplog.at_level(logging.INFO):
         for _ in range(150):
             assert _update(bot, ctx, mgr, 72, level_idx=0) is None
+    assert any(
+        r.levelno == logging.ERROR and "SLOT GUARD STALL" in r.message
+        for r in caplog.records
+    )
+
+
+def test_empty_ask_level_short_of_shares_holds_quietly(caplog):
+    """Market 773, 2026-09-28: L0 kept at 36c for lack of shares sits on
+    L1's target; L1 could not place anyway. Not a wedge: no ERROR."""
+    import logging
+    bot = _quote_bot()
+    bot._free_to_sell.return_value = 0
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.ASK, 36, 64, "t0", level_idx=0)
+    with caplog.at_level(logging.INFO):
+        for _ in range(300):
+            assert _update(bot, ctx, mgr, 36, amount=60, level_idx=1,
+                           side=Side.ASK) is None
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert any("SLOT GUARD HOLD" in r.message for r in caplog.records)
+    assert not any("SLOT GUARD STALL" in r.message for r in caplog.records)
+    bot._place_ask.assert_not_called()
+
+
+def test_empty_ask_level_with_shares_still_escalates(caplog):
+    import logging
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.ASK, 36, 64, "t0", level_idx=0)
+    with caplog.at_level(logging.INFO):
+        for _ in range(150):
+            assert _update(bot, ctx, mgr, 36, amount=60, level_idx=1,
+                           side=Side.ASK) is None
     assert any(
         r.levelno == logging.ERROR and "SLOT GUARD STALL" in r.message
         for r in caplog.records
