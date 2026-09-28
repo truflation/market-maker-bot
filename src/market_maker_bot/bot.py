@@ -2392,7 +2392,31 @@ class AvellanedaMarketMaker:
             # quote, book thinner than designed) or a state the inversion
             # healer above did not recognize.
             benign_hold = current_order is not None
-            if benign_hold:
+            # An empty ASK level that could not place even with the slot
+            # free is short of shares, not wedged: the neighbor usually sits
+            # on this target because it was kept at its old price for the
+            # same reason (market 773, 2026-09-28: paged every 5 min for 13h
+            # with 124 shares of asks on 100 pre-minted pairs).
+            inventory_limited = (
+                not benign_hold
+                and side == Side.ASK
+                and self._free_to_sell(context, outcome) < amount
+            )
+            if inventory_limited:
+                if skips % SLOT_GUARD_STALL_ERROR_EVERY == 0:
+                    logger.info(
+                        f"SLOT GUARD HOLD: market {context.query_id} "
+                        f"{side.value} L{level_idx} empty for {skips} cycles "
+                        f"(target @{new_price}c held by L{owner_lvl}; "
+                        f"inventory short of x{amount} anyway)"
+                    )
+                else:
+                    logger.debug(
+                        f"Market {context.query_id} {side.value} "
+                        f"L{level_idx}: skip @{new_price}c, slot owned by "
+                        f"L{owner_lvl}, inventory short"
+                    )
+            elif benign_hold:
                 if skips % SLOT_GUARD_STALL_ERROR_EVERY == 0:
                     logger.info(
                         f"SLOT GUARD HOLD: market {context.query_id} "
