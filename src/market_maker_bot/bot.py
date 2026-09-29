@@ -7,6 +7,7 @@ Coordinates all components: pricing, indicators, inventory, and order management
 import json
 import math
 import os
+import re
 import sys
 import time
 import logging
@@ -1939,6 +1940,111 @@ class AvellanedaMarketMaker:
         ]
         return inv.free_to_sell(outcome, tracked)
 
+    def _move_ask(
+        self,
+        context: MarketContext,
+        outcome: bool,
+        current_order,
+        new_price: int,
+        amount: int,
+        order_mgr,
+        level_idx: int,
+    ):
+        """Move an inventory-backed ask with one atomic change_ask.
+
+        The chain moves the resting sell to `new_price` and only pulls from
+        holdings the shares the new amount adds over what actually rests (or
+        returns the excess), so a move at the same size needs no free shares.
+        Before this, a move was cancel-then-place: the cancelled shares only
+        count as free after the next inventory refresh, so an up-move on a
+        book with few spare shares pulled the ask and re-placed it ~30s later
+        (CESR 2026-09-29: 162 pull/re-place cycles in 30 minutes).
+
+        The size is the target capped at what rests plus free shares, so a
+        short book moves at a smaller size instead of being pulled. Unlike a
+        cancel, change_ask keeps the old ask's shares in the order, so the
+        free count is taken as is (no assume_cancelled): an ask moved since
+        the last read already counts in full there, and a second move before
+        the next refresh cannot spend the same shares twice.
+
+        Returns None to fall back to the cancel/place path (size below the
+        protocol minimum), (tx_hash, size) on success, or (None, 0) when the
+        chain reported fewer shares than counted: the tracked amount and the
+        holdings are corrected from its error and the next cycle re-sizes.
+        The holdings cap lasts until the next inventory refresh, so a gateway
+        that keeps over-stating holdings costs at most one failed move per
+        level per refresh.
+        """
+        inv = self._inventory.get_market_inventory(context.query_id)
+        resting = current_order.amount
+        if current_order.created_at < inv.refreshed_at:
+            # The last read saw this ask: a smaller listing means part filled.
+            resting = min(
+                resting,
+                inv.listed_by_price.get((outcome, current_order.price), 0),
+            )
+        free = self._free_to_sell(context, outcome)
+        size = min(amount, resting + free)
+        if size <= 0 or not _meets_min_notional(new_price, size):
+            return None
+        try:
+            tx_hash = self._client.change_ask(
+                query_id=context.query_id,
+                outcome=outcome,
+                old_price=current_order.price,
+                new_price=new_price,
+                new_amount=size,
+                wait=True,
+            )
+        except Exception as exc:
+            match = re.search(
+                r"Need (\d+) more shares, but only have (\d+)", str(exc)
+            )
+            if match is None:
+                if not (
+                    self._is_definitive_rejection(exc)
+                    or "old order not found" in str(exc).lower()
+                ):
+                    # A timeout may still land and pull the extra shares.
+                    inv.note_unconfirmed_sell(
+                        outcome, new_price, max(0, size - current_order.amount),
+                        time.time(),
+                    )
+                raise
+            # The chain measured the extra against what actually rests.
+            actual = size - int(match.group(1))
+            inv.note_holdings(outcome, int(match.group(2)))
+            if actual < current_order.amount:
+                logger.warning(
+                    f"Market {context.query_id} ask L{level_idx}: ask "
+                    f"@{current_order.price}c rests x{actual}, not "
+                    f"x{current_order.amount} (partly filled); corrected"
+                )
+                order_mgr.record_order(
+                    outcome, Side.ASK, current_order.price, actual,
+                    current_order.tx_hash, level_idx, is_inventory_backed=True,
+                )
+                self._order_state.update_order(
+                    query_id=context.query_id, outcome=outcome, is_buy=False,
+                    old_price=current_order.price, new_price=current_order.price,
+                    amount=actual, order_id=current_order.tx_hash,
+                    level_idx=level_idx, is_inventory_backed=True,
+                )
+            else:
+                logger.warning(
+                    f"Market {context.query_id} ask L{level_idx}: holdings "
+                    f"short (chain has {match.group(2)}); re-sizing next cycle"
+                )
+            return None, 0
+        inv.release_pair(outcome, current_order.amount)
+        inv.reserve_pair(outcome, size)
+        if size < amount:
+            logger.info(
+                f"Market {context.query_id} ask L{level_idx}: moved at x{size} "
+                f"(target x{amount}; resting {resting}, free {free})"
+            )
+        return tx_hash, size
+
     def _place_ask(
         self,
         context: MarketContext,
@@ -2531,6 +2637,16 @@ class AvellanedaMarketMaker:
                             current_order.price, current_order.amount,
                         )
                         raise
+                elif current_order.is_inventory_backed and (
+                    moved := self._move_ask(
+                        context, outcome, current_order, new_price, amount,
+                        order_mgr, level_idx,
+                    )
+                ) is not None:
+                    tx_hash, amount = moved
+                    if tx_hash is None:
+                        return None
+                    is_inv_backed = True
                 else:
                     # Pre-check: can the inventory path place this ask at
                     # all? If not, keep the old ask only while it is no more

@@ -68,6 +68,11 @@ class MarketInventory:
     listed_by_price: dict = field(default_factory=dict)
     refreshed_at: float = 0.0
     unconfirmed_sells: list = field(default_factory=list)
+    # Holdings the chain itself reported since the last refresh (from a
+    # change_ask "only have N in holdings" error), keyed by outcome. Caps
+    # held in free_to_sell() so a read that over-states holdings cannot make
+    # the same failing move repeat every cycle.
+    holdings_cap: dict = field(default_factory=dict)
 
     def reserve_pair(self, outcome: bool, n: int) -> None:
         """Vestigial: asks are sized by free_to_sell(), not by these
@@ -110,6 +115,10 @@ class MarketInventory:
         if n > 0:
             self.unconfirmed_sells.append((outcome, price, n, noted_at))
 
+    def note_holdings(self, outcome: bool, n: int) -> None:
+        """The chain reported `n` shares held on `outcome`; cap until refresh."""
+        self.holdings_cap[outcome] = min(n, self.holdings_cap.get(outcome, n))
+
     def free_to_sell(self, outcome: bool, tracked_asks: list) -> int:
         """Shares free to back a new inventory-backed ASK on `outcome`.
 
@@ -129,6 +138,8 @@ class MarketInventory:
         orphan orders) are neither added nor subtracted.
         """
         held = self.yes_shares if outcome else self.no_shares
+        if outcome in self.holdings_cap:
+            held = min(held, self.holdings_cap[outcome])
         seen: dict = {}
         pending = sum(n for o, _, n, _ in self.unconfirmed_sells if o == outcome)
         for price, amount, created_at in tracked_asks:
@@ -191,6 +202,7 @@ class MarketInventory:
         self.chain_listed_no_sells = chain_listed_no_sells
         self.listed_by_price = dict(listed_by_price or {})
         self.refreshed_at = refreshed_at
+        self.holdings_cap = {}
         # Drop an unconfirmed sell once this read shows it listed (it landed
         # and held already excludes it) or once it is too old to still land.
         self.unconfirmed_sells = [
