@@ -195,6 +195,7 @@ def _bot(inv):
     bot._inventory.get_market_inventory.return_value = inv
     for name in (
         "_free_to_sell",
+        "_move_ask",
         "_place_ask",
         "_cancel_ask",
         "_level_slot_cooling",
@@ -205,6 +206,7 @@ def _bot(inv):
     bot._is_cancel_not_found = AvellanedaMarketMaker._is_cancel_not_found
     bot._is_definitive_rejection.return_value = False
     bot._client.place_sell_order.return_value = "tx-new"
+    bot._client.change_ask.return_value = "tx-change"
     return bot
 
 
@@ -228,7 +230,7 @@ def test_new_ask_places_from_shares_the_old_count_hid():
     assert bot._place_ask(ctx, True, 39, 12) == ("tx-new", True)
 
 
-def test_refresh_moves_an_ask_from_held_shares():
+def test_refresh_moves_an_ask_with_one_change_ask():
     inv = _inv(yes=6, listed={(True, 38): 6})
     bot = _bot(inv)
     ctx = _Ctx()
@@ -241,19 +243,19 @@ def test_refresh_moves_an_ask_from_held_shares():
         bot, ctx, True, Side.ASK, 39, 6, mgr, 0
     )
 
-    assert result == "tx-new"
-    assert [c.kwargs["price"] for c in bot._client.cancel_order.call_args_list] == [38]
-    assert ctx.yes_orders.get_ask(0).price == 39
-    bot._order_state.untrack_order.assert_called_once_with(
-        query_id=5, outcome=True, is_buy=False, price=38, level_idx=0
+    assert result == "tx-change"
+    bot._client.change_ask.assert_called_once_with(
+        query_id=5, outcome=True, old_price=38, new_price=39, new_amount=6,
+        wait=True,
     )
+    bot._client.cancel_order.assert_not_called()
+    bot._client.place_sell_order.assert_not_called()
+    assert ctx.yes_orders.get_ask(0).price == 39
 
 
-def test_refresh_with_everything_listed_pulls_rather_than_oversells():
-    # A taker may have filled part of the 38c ask since the read, so the
-    # cancel's returned shares are not counted: the ask is pulled and the
-    # level waits for the next refresh instead of selling shares that may
-    # not exist.
+def test_refresh_with_everything_listed_moves_instead_of_pulling():
+    # Nothing held and the 38c ask fully listed: the old cancel/place path
+    # pulled it and waited for a refresh. change_ask moves the same shares.
     inv = _inv(yes=0, listed={(True, 38): 6})
     bot = _bot(inv)
     ctx = _Ctx()
@@ -264,25 +266,32 @@ def test_refresh_with_everything_listed_pulls_rather_than_oversells():
 
     assert AvellanedaMarketMaker._update_single_order(
         bot, ctx, True, Side.ASK, 39, 6, mgr, 0
-    ) is None
-    bot._client.place_sell_order.assert_not_called()
-    assert ctx.yes_orders.get_ask(0) is None
+    ) == "tx-change"
+    bot._client.cancel_order.assert_not_called()
+    assert (ctx.yes_orders.get_ask(0).price, ctx.yes_orders.get_ask(0).amount) == (39, 6)
+    # The moved ask counts as unseen until the next refresh: nothing extra
+    # becomes free.
+    assert inv.free_to_sell(
+        True, [(39, 6, ctx.yes_orders.get_ask(0).created_at)]
+    ) == 0
 
 
 def test_failed_place_after_cancel_leaves_no_stale_record():
-    inv = _inv(yes=6, listed={(True, 38): 6})
+    # Legacy record: change_ask does not apply, so the cancel/place path runs.
+    inv = _inv(yes=6)
     bot = _bot(inv)
     bot._client.place_sell_order.side_effect = Exception("gateway timeout")
     ctx = _Ctx()
     mgr = OrderManager(ctx, refresh_tolerance_pct=0.0, max_order_age=1e9)
     mgr.record_order(True, Side.ASK, 38, 6, "old", level_idx=0,
-                     is_inventory_backed=True)
+                     is_inventory_backed=False)
     _seen(inv)
 
     AvellanedaMarketMaker._update_single_order(
         bot, ctx, True, Side.ASK, 39, 6, mgr, 0
     )
 
+    bot._client.change_ask.assert_not_called()
     assert ctx.yes_orders.get_ask(0) is None
     bot._order_state.untrack_order.assert_called_once_with(
         query_id=5, outcome=True, is_buy=False, price=38, level_idx=0

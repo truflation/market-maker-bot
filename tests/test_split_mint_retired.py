@@ -70,6 +70,7 @@ def _bot(inv):
     bot._inventory.get_market_inventory.return_value = inv
     for name in (
         "_free_to_sell",
+        "_move_ask",
         "_place_ask",
         "_cancel_ask",
         "_level_slot_cooling",
@@ -80,6 +81,14 @@ def _bot(inv):
     bot._is_cancel_not_found = AvellanedaMarketMaker._is_cancel_not_found
     bot._is_definitive_rejection.return_value = False
     bot._client.place_sell_order.return_value = "tx-sell"
+    bot._client.change_ask.return_value = "tx-change"
+    return bot
+
+
+def _no_move(bot):
+    # These tests cover the cancel/pull fallback used when change_ask does
+    # not apply (a move below the protocol minimum, or a legacy record).
+    bot._move_ask = MagicMock(return_value=None)
     return bot
 
 
@@ -130,7 +139,7 @@ def _short_inv():
 
 
 def test_refresh_keeps_old_ask_priced_at_or_above_target():
-    bot = _bot(_short_inv())
+    bot = _no_move(_bot(_short_inv()))
     ctx = _Ctx()
 
     assert _refresh(bot, ctx, old_price=40, new_price=39) is None
@@ -142,7 +151,7 @@ def test_refresh_keeps_old_ask_priced_at_or_above_target():
 def test_refresh_pulls_old_ask_priced_below_target():
     # Fair moved up: a kept 38c ask would be lifted cheap or crossed by our
     # own re-priced bid. Pull it and leave the level empty.
-    bot = _bot(_short_inv())
+    bot = _no_move(_bot(_short_inv()))
     ctx = _Ctx()
 
     assert _refresh(bot, ctx, old_price=38, new_price=39) is None
@@ -220,7 +229,7 @@ NOT_FOUND = Exception("ERROR: Order not found or does not belong to you")
 
 def test_pull_releases_the_reservation():
     inv = _short_inv()
-    bot = _bot(inv)
+    bot = _no_move(_bot(inv))
 
     _refresh(bot, _Ctx(), old_price=38, new_price=39)
 
@@ -229,7 +238,7 @@ def test_pull_releases_the_reservation():
 
 def test_pull_cancel_error_keeps_state_and_reservation():
     inv = _short_inv()
-    bot = _bot(inv)
+    bot = _no_move(_bot(inv))
     ctx = _Ctx()
     bot._client.cancel_order.side_effect = Exception("gateway timeout")
 
@@ -241,7 +250,7 @@ def test_pull_cancel_error_keeps_state_and_reservation():
 
 def test_pull_cancel_not_found_clears_and_releases_once():
     inv = _short_inv()
-    bot = _bot(inv)
+    bot = _no_move(_bot(inv))
     ctx = _Ctx()
     bot._client.cancel_order.side_effect = NOT_FOUND
 
@@ -264,7 +273,7 @@ def test_pull_of_resting_legacy_ask_that_errors_keeps_state():
 
 
 def test_next_cycle_after_a_pull_places_nothing():
-    bot = _bot(_short_inv())
+    bot = _no_move(_bot(_short_inv()))
     ctx = _Ctx()
     mgr = OrderManager(ctx, refresh_tolerance_pct=0.0, max_order_age=1e9)
     mgr.record_order(True, Side.ASK, 38, 3, "tx-old", level_idx=0,
