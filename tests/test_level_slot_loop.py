@@ -300,6 +300,7 @@ def _reconcile_bot(settle_time):
     bot._markets = {7: ctx}
     bot._order_state.get_market_orders.return_value = []
     bot._reconcile_cancel_attempts = {}
+    bot._fair_pulled = {}
     bot._cancel_not_found_times = deque()
     bot._bid_budget = MagicMock()
     bot._pre_settlement_pulled = set()

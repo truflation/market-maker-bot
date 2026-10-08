@@ -61,6 +61,7 @@ def _bot_mock(tracked_orders: list[TrackedOrder],
     # carry "".
     bot.config.maa_address = ""
     bot._reconcile_cancel_attempts = {}
+    bot._fair_pulled = {}
     qids = sorted({qid for qid, _ in order_books.keys()})
     bot._markets = {qid: MagicMock() for qid in qids}
     # A MagicMock settle_time is truthy and non-comparable; real configs
