@@ -32,6 +32,7 @@ from .market import (
     convert_price_for_order,
 )
 from .pricing import AvellanedaPricing, InventoryManager, price_binary_option
+from .pricing import band_fair
 from .indicators import (
     InstantVolatilityIndicator,
     OrderBookDepthAnalyzer,
@@ -53,6 +54,21 @@ from .order_state import OrderStateManager, TrackedOrder
 from .bid_budget import BidBudget
 
 logger = logging.getLogger(__name__)
+
+# Seconds after a stream-priced market is pulled during which reconcile
+# leaves it alone (its wait=False pull cancels are still landing).
+FAIR_PULL_RECONCILE_GRACE = 180.0
+# Seconds between cancel retries on a pulled market that still tracks orders.
+FAIR_PULL_RETRY = 60.0
+
+
+def _has_tracked_orders(context: MarketContext) -> bool:
+    return any(
+        order is not None
+        for outcome in (True, False)
+        for level_list in (context.get_orders(outcome).bids, context.get_orders(outcome).asks)
+        for order in level_list
+    )
 
 SETTLED_MARKET_ERRORS = (
     "already settled",
@@ -295,6 +311,18 @@ class AvellanedaMarketMaker:
         # before it can quote -- a persisted "pulled" flag could go stale and
         # leave leaked orders live (fail-open). This re-asserts each session.
         self._earnings_pulled_session: Set[int] = set()
+        # fair_model="stream_bands" markets. One cached read per stream:
+        # (stream_id, provider) -> (event times, values, fetched_at), plus
+        # the last attempt time so a failing read is retried once per
+        # interval, not once per market per cycle. `_fair_pulled` maps a
+        # market to why it is not quoting ("decided" / "stale"); in-memory
+        # like the earnings pull: the first cycle after a restart
+        # re-evaluates from the stream and cancels before quoting.
+        self._stream_cache: Dict[Tuple[str, str], Tuple[List[int], List[float], float]] = {}
+        self._stream_attempt: Dict[Tuple[str, str], float] = {}
+        self._fair_pulled: Dict[int, Tuple[str, float]] = {}  # qid -> (reason, pulled_at)
+        self._fair_pull_retry_at: Dict[int, float] = {}
+        self._last_fair: Dict[int, Tuple[int, int]] = {}
 
         # Order state persistence (for restart recovery)
         self._order_state = OrderStateManager(config.order_state_file)
@@ -763,6 +791,111 @@ class AvellanedaMarketMaker:
 
         logger.info(f"Order reconciliation complete: {recovered} recovered, {stale} stale")
 
+    def _stream_series(
+        self, cfg: MarketConfig
+    ) -> Optional[Tuple[List[int], List[float], float]]:
+        """Cached (event times, values, fetched_at) for a market's stream.
+
+        Re-read at most once per stream_refresh_interval, shared by every
+        market on the stream. A failed read keeps the previous series; its
+        fetched_at then ages until _fair_gate calls the market stale.
+        """
+        key = (cfg.stream_id, (cfg.data_provider or "").lower())
+        now = time.time()
+        entry = self._stream_cache.get(key)
+        interval = self.config.stream_refresh_interval
+        if (entry is None or now - entry[2] >= interval) and (
+            now - self._stream_attempt.get(key, 0.0) >= interval
+        ):
+            self._stream_attempt[key] = now
+            try:
+                records = self._client.get_records(
+                    stream_id=cfg.stream_id,
+                    data_provider=cfg.data_provider,
+                    date_from=int(now) - self.config.stream_lookback_days * 86400,
+                    # Up to the latest settle on this stream, not now: a
+                    # record published ahead of its event time is still the
+                    # deciding one (review, 10-08). The read is shared, so
+                    # it must cover every market on the stream.
+                    date_to=max(
+                        [int(now), cfg.settle_time or 0]
+                        + [
+                            c.config.settle_time or 0
+                            for c in self._markets.values()
+                            if (c.config.stream_id, (c.config.data_provider or "").lower()) == key
+                        ]
+                    ),
+                )
+                if records and hasattr(records[0], "dict"):
+                    records = [r.dict() if hasattr(r, "dict") else r for r in records]
+                times, values = band_fair.clean_series(records or [])
+                if values:
+                    entry = (times, values, now)
+                    self._stream_cache[key] = entry
+                else:
+                    logger.warning(f"Stream {cfg.stream_id}: read returned no records")
+            except Exception as e:
+                logger.warning(f"Stream {cfg.stream_id}: read failed: {e}")
+        return entry
+
+    def _fair_gate(self, context: MarketContext) -> Optional[str]:
+        """Price a fair_model market from its stream, or say why not to quote.
+
+        Returns None after setting context.initial_price_yes/no, or why not:
+          "stale"          the last good read is older than stream_max_staleness,
+                           or the latest record is older than
+                           stream_max_record_age (a stream that stopped
+                           printing: k counts calendar days, so a skipped day
+                           would make a decided band look live)
+          "decided"        the deciding record is already on chain (quoting a
+                           decided band only offers the winner below 100 or
+                           the loser above 0)
+          "short history"  too few records to price (a new stream)
+        """
+        cfg = context.config
+        entry = self._stream_series(cfg)
+        now = time.time()
+        if entry is None or now - entry[2] > self.config.stream_max_staleness:
+            return "stale"
+        times, values, _ = entry
+        if (
+            self.config.stream_max_record_age > 0
+            and now - times[-1] > self.config.stream_max_record_age
+        ):
+            return "stale"
+        prior = cfg.initial_probability
+        if prior is None or not 0.0 <= prior <= 1.0:
+            prior = 0.2
+        p, k = band_fair.band_probability(
+            times, values, cfg.lower_bound, cfg.upper_bound, cfg.settle_time, prior
+        )
+        if k == 0:
+            return "decided"
+        if p is None:
+            return "short history"
+        fair = max(1, min(99, int(round(p * 100))))
+        context.initial_price_yes = float(fair)
+        context.initial_price_no = float(100 - fair)
+        if self._last_fair.get(context.query_id) != (fair, k):
+            logger.info(
+                f"Market {context.query_id}: stream fair-YES {fair}c "
+                f"({k} record(s) to land, latest {values[-1]})"
+            )
+            self._last_fair[context.query_id] = (fair, k)
+        return None
+
+    def _clamp_to_fair(
+        self, context: MarketContext, outcome: bool, bid_price: int, ask_price: int
+    ) -> Tuple[int, int]:
+        """Bid at most fair - half, ask at least fair + half (cents, 1-99)."""
+        fair = context.initial_price_yes if outcome else context.initial_price_no
+        if fair is None:
+            return bid_price, ask_price
+        half = max(1, math.ceil(self.config.avellaneda.min_spread_cents / 2))
+        bid = max(1, min(bid_price, int(math.floor(fair - half))))
+        ask = min(99, max(ask_price, int(math.ceil(fair + half))))
+        return bid, ask
+
     def _calculate_initial_price(
         self, market_config: MarketConfig
     ) -> Optional[float]:
@@ -1008,6 +1141,14 @@ class AvellanedaMarketMaker:
                 settle_ts_mkt - self.config.pre_settlement_cutoff
             ):
                 continue
+            # A stream-priced market pulled moments ago (decided or stale):
+            # its wait=False cancels would race this pass. After the grace
+            # window reconcile runs again, and with nothing tracked any of
+            # our orders still resting there (a cancel that silently failed)
+            # are orphans and get cancelled.
+            pulled = self._fair_pulled.get(query_id)
+            if pulled is not None and time.time() - pulled[1] < FAIR_PULL_RECONCILE_GRACE:
+                continue
             bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
             asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
             # 2026-09-07 incident (#43): a failed read left bids/asks empty,
@@ -1187,6 +1328,7 @@ class AvellanedaMarketMaker:
                         cutoff_ok
                         and query_id not in self._pre_settlement_pulled
                         and query_id not in self._earnings_pulled_session
+                        and query_id not in self._fair_pulled
                     ):
                         for outcome in (True, False):
                             if backstops_placed >= MAX_BACKSTOPS_PER_PASS:
@@ -1324,6 +1466,11 @@ class AvellanedaMarketMaker:
                     query_id, settle_time, cutoff_buffer,
                 )
                 continue
+            if context.config.fair_model:
+                reason = self._fair_gate(context)
+                if reason is not None:
+                    logger.info("Pre-mint skip market %d: %s", query_id, reason)
+                    continue
             inv = self._inventory.get_market_inventory(query_id)
             paired = inv.paired_inventory()
             deficit = max(0, int(target) - int(paired))
@@ -1823,6 +1970,14 @@ class AvellanedaMarketMaker:
         bid_price, ask_price = self._apply_transaction_costs(
             bid_price, ask_price, fee_pct=0.0
         )
+
+        # Stream-priced markets: never quote through fair. Inventory skew may
+        # lean the quotes, but an ask below fair (or a bid above it) by more
+        # than half the minimum spread is a gift to an informed taker.
+        if context.config.fair_model:
+            bid_price, ask_price = self._clamp_to_fair(
+                context, outcome, bid_price, ask_price
+            )
 
         # Defensive self-match check. After all the optimization+transaction
         # steps above, verify bid < ask within this (market, outcome). The
@@ -3004,7 +3159,13 @@ class AvellanedaMarketMaker:
                         )
                     self.stats.orders_cancelled += 1
 
-                    # Untrack the order
+                    # Untrack the order, and free its slot: a pulled
+                    # stream-priced market can resume quoting, and a slot
+                    # left set would be re-cancelled / moved as if live.
+                    if side == Side.BID:
+                        orders.set_bid(lvl_idx, None)
+                    else:
+                        orders.set_ask(lvl_idx, None)
                     self._order_state.untrack_order(
                         query_id=context.query_id,
                         outcome=outcome,
@@ -3076,6 +3237,40 @@ class AvellanedaMarketMaker:
                     self._save_pre_settlement_pulled()
                 return
 
+        # Stream-priced bands: reprice from the stream every cycle; stop
+        # quoting once the band is decided or the stream read is stale.
+        # 2026-10-08: fixed per-band priors kept offering decided bands at
+        # 38-41c; an informed taker took 53 fills on them.
+        if context.config.fair_model:
+            reason = self._fair_gate(context)
+            if reason is not None:
+                qid = context.query_id
+                now = time.time()
+                pulled = self._fair_pulled.get(qid)
+                if pulled is None or pulled[0] != reason:
+                    logger.info(
+                        f"Market {qid}: not quoting ({reason}). Pulling liquidity."
+                    )
+                    self._cancel_market_orders(context)
+                    self._fair_pulled[qid] = (reason, now)
+                    self._fair_pull_retry_at[qid] = now
+                elif (
+                    _has_tracked_orders(context)
+                    and now - self._fair_pull_retry_at.get(qid, 0.0) >= FAIR_PULL_RETRY
+                ):
+                    # A cancel that raised leaves its order tracked (and
+                    # resting): reconcile never sweeps a tracked order, so
+                    # retry here until the market is clear.
+                    logger.warning(
+                        f"Market {qid}: orders still tracked after pull ({reason}); "
+                        f"retrying cancel"
+                    )
+                    self._cancel_market_orders(context)
+                    self._fair_pull_retry_at[qid] = now
+                return
+            if self._fair_pulled.pop(context.query_id, None) is not None:
+                logger.info(f"Market {context.query_id}: stream fresh again, quoting")
+
         mode = context.config.outcome_mode
 
         # Determine which outcomes to trade
@@ -3095,7 +3290,10 @@ class AvellanedaMarketMaker:
                 self._process_hanging_orders(context, outcome)
 
             # Refresh pricing from Black-Scholes or order book
-            if self.config.pricing_source == "black_scholes":
+            # (stream-priced markets were priced by _fair_gate above)
+            if context.config.fair_model:
+                pass
+            elif self.config.pricing_source == "black_scholes":
                 # Always refresh B-S pricing each cycle
                 initial_price = self._calculate_initial_price(context.config)
                 if initial_price is not None:
@@ -3115,7 +3313,9 @@ class AvellanedaMarketMaker:
 
             # Check for order_override
             mid_price = context.get_mid_price(outcome, self.config.pricing_source)
-            if mid_price is not None:
+            # (the override path places around mid without the fair clamp,
+            # so stream-priced markets never take it)
+            if mid_price is not None and not context.config.fair_model:
                 override_proposals = self._create_proposal_from_order_override(mid_price)
                 if override_proposals:
                     self._execute_order_override(context, outcome, override_proposals)

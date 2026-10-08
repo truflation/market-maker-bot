@@ -164,10 +164,30 @@ class MarketConfig:
     # permanent fair-value source; only pricing_source="order_book" falls
     # back to order-book mid once liquidity accumulates.
     initial_probability: Optional[float] = None
+    # Fair-value model. None keeps the paths above (initial_probability or
+    # Black-Scholes). "stream_bands": fair YES comes from the stream's own
+    # history every cycle (pricing/band_fair.py) for the band given by
+    # lower_bound/upper_bound (None = open end); initial_probability, when
+    # set, is only the prior it blends with. The market stops quoting once
+    # the deciding record is on chain, and while stream reads are stale.
+    # For streams that print once a day.
+    fair_model: Optional[str] = None
 
     def __post_init__(self):
         if not self.name:
             self.name = f"Market-{self.query_id}"
+        if self.fair_model not in (None, "stream_bands"):
+            raise ValueError(
+                f"Market {self.query_id}: unknown fair_model {self.fair_model!r}"
+            )
+        if self.fair_model and (
+            (self.lower_bound is None and self.upper_bound is None)
+            or self.settle_time is None
+        ):
+            raise ValueError(
+                f"Market {self.query_id}: fair_model needs settle_time and "
+                f"lower_bound or upper_bound"
+            )
         # Derive the earnings quote-cutoff from earnings_date + earnings_timing.
         # Fail LOUD on a partial/invalid spec (raises) rather than silently
         # quoting a market past its earnings print: an unusable earnings config
@@ -453,6 +473,15 @@ class BotConfig:
     level_loop_threshold: int = 4
     level_loop_window: float = 120.0
     level_loop_cooldown: float = 300.0
+    # fair_model markets: how often a stream's records are re-read (one
+    # read per stream, shared by its markets), how old the last good read
+    # may get before those markets stop quoting (fail closed), how old the
+    # stream's latest record may be before they stop quoting (a daily
+    # stream that skipped a day; 0 disables), and how much history is read.
+    stream_refresh_interval: float = 15.0
+    stream_max_staleness: float = 600.0
+    stream_max_record_age: float = 144000.0  # 40h
+    stream_lookback_days: int = 200
 
 
 def load_config_from_dict(data: dict) -> BotConfig:
@@ -493,4 +522,8 @@ def load_config_from_dict(data: dict) -> BotConfig:
         level_loop_threshold=data.get("level_loop_threshold", 4),
         level_loop_window=data.get("level_loop_window", 120.0),
         level_loop_cooldown=data.get("level_loop_cooldown", 300.0),
+        stream_refresh_interval=data.get("stream_refresh_interval", 15.0),
+        stream_max_staleness=data.get("stream_max_staleness", 600.0),
+        stream_max_record_age=data.get("stream_max_record_age", 144000.0),
+        stream_lookback_days=data.get("stream_lookback_days", 200),
     )
