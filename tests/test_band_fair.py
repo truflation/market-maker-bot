@@ -59,7 +59,7 @@ def test_k_across_dst_and_stamp_drift():
     # 21:00 UTC record, Mar 8 21:00 UTC settle = 24h -> 1.
     assert bf.steps_remaining(1_793_476_800, 1_793_476_800 + 26 * 3600) == 1
     assert bf.steps_remaining(1_804_446_000, 1_804_446_000 + 24 * 3600) == 1
-    # Gas stamps drifted 02:30 -> 03:10; a 16:00 settle still counts 1 then 0.
+    # Stamps drifting 02:30 -> 03:10; a 16:00 settle still counts 1 then 0.
     assert bf.steps_remaining(T0, T0 + 36 * 3600) == 1
     assert bf.steps_remaining(T0 + DAY, T0 + 36 * 3600) == 0
     # A record stamped after settle is already decided.
