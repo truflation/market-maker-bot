@@ -896,6 +896,83 @@ class AvellanedaMarketMaker:
         ask = min(99, max(ask_price, int(math.ceil(fair + half))))
         return bid, ask
 
+    def _sweep_through_fair(self, context: MarketContext) -> int:
+        """Cancel resting orders a stream-priced market would not quote now.
+
+        The fair clamp only shapes new proposals. A resting order the update
+        path leaves alone (a slot-guard hold, a level inside the refresh
+        tolerance, a fill delay) keeps its old price when fair moves: on
+        YES bids at 6c/4c sat over a 3c fair for hours under a SLOT
+        GUARD HOLD. Any tracked bid above fair - half or ask below
+        fair + half is cancelled here; the update path re-places it at a
+        clamped price. Runs after the update path, so it only catches what
+        that path left. Cancels wait for the chain so a failure stays
+        tracked and is retried next cycle. Returns the number cancelled.
+        """
+        half = max(1, math.ceil(self.config.avellaneda.min_spread_cents / 2))
+        swept = 0
+        for outcome in (True, False):
+            fair = context.initial_price_yes if outcome else context.initial_price_no
+            if fair is None:
+                continue
+            bid_max = max(1, int(math.floor(fair - half)))
+            ask_min = min(99, int(math.ceil(fair + half)))
+            orders = context.get_orders(outcome)
+            for side, level_list in ((Side.BID, orders.bids), (Side.ASK, orders.asks)):
+                for lvl_idx, order in list(enumerate(level_list)):
+                    if order is None:
+                        continue
+                    if side == Side.BID and order.price <= bid_max:
+                        continue
+                    if side == Side.ASK and order.price >= ask_min:
+                        continue
+                    try:
+                        if side == Side.ASK:
+                            self._cancel_ask(
+                                context=context, outcome=outcome,
+                                price=order.price, amount=order.amount,
+                                is_inventory_backed=order.is_inventory_backed,
+                                wait=True,
+                            )
+                        else:
+                            self._client.cancel_order(
+                                query_id=context.query_id, outcome=outcome,
+                                price=convert_price_for_order(order.price, side),
+                                wait=True,
+                            )
+                    except Exception as exc:
+                        if not self._is_cancel_not_found(exc):
+                            logger.warning(
+                                f"FAIR SWEEP: market {context.query_id} cancel of "
+                                f"{side.value} L{lvl_idx}@{order.price}c failed, "
+                                f"retrying next cycle: {exc}"
+                            )
+                            continue
+                        # Gone already (filled or cancelled): drop it.
+                        self._note_cancel_not_found(
+                            context.query_id,
+                            f"bid {'YES' if outcome else 'NO'} {order.price}c",
+                        )
+                    if side == Side.BID:
+                        orders.set_bid(lvl_idx, None)
+                    else:
+                        orders.set_ask(lvl_idx, None)
+                    self._order_state.untrack_order(
+                        query_id=context.query_id, outcome=outcome,
+                        is_buy=(side == Side.BID), price=order.price,
+                        level_idx=lvl_idx,
+                    )
+                    swept += 1
+                    if swept % 5 == 0:
+                        self._write_heartbeat()
+                    logger.warning(
+                        f"FAIR SWEEP: market {context.query_id} "
+                        f"{'YES' if outcome else 'NO'} {side.value} L{lvl_idx} "
+                        f"@{order.price}c was through fair {fair:.0f}c (+/-{half}c); "
+                        f"cancelled"
+                    )
+        return swept
+
     def _calculate_initial_price(
         self, market_config: MarketConfig
     ) -> Optional[float]:
@@ -3372,6 +3449,11 @@ class AvellanedaMarketMaker:
 
             # Execute order updates
             self._execute_order_updates(context, outcome, pricing)
+
+        # After the update path (which moves what it can atomically with
+        # change_bid/change_ask), cancel whatever it left resting through fair.
+        if context.config.fair_model:
+            self._sweep_through_fair(context)
 
     def _process_hanging_orders(
         self, context: MarketContext, outcome: bool

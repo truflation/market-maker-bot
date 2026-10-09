@@ -58,7 +58,8 @@ def _bot(records):
     bot._earnings_pulled_session = set()
     bot._client.get_records.return_value = records
     bot._create_proposal_from_order_override.return_value = None
-    for name in ("_stream_series", "_fair_gate", "_clamp_to_fair"):
+    bot._is_cancel_not_found = AvellanedaMarketMaker._is_cancel_not_found
+    for name in ("_stream_series", "_fair_gate", "_clamp_to_fair", "_sweep_through_fair"):
         setattr(bot, name, getattr(AvellanedaMarketMaker, name).__get__(bot))
     return bot
 
@@ -260,3 +261,75 @@ def test_a_shared_read_covers_every_settle_on_the_stream():
     bot._markets = {1: MarketContext(config=near), 2: MarketContext(config=far)}
     AvellanedaMarketMaker._fair_gate(bot, bot._markets[1])
     assert bot._client.get_records.call_args.kwargs["date_to"] == far.settle_time
+
+
+def _held(ctx, outcome, side, price, lvl, inv=True):
+    OrderManager(ctx, 0.0, 1e9).record_order(
+        outcome, side, price, 6, f"tx{price}", level_idx=lvl, is_inventory_backed=inv)
+
+
+def _swept_ctx(fair_yes=3):
+    ctx = MarketContext(config=_cfg())
+    ctx.initial_price_yes, ctx.initial_price_no = float(fair_yes), float(100 - fair_yes)
+    return ctx
+
+
+def test_sweep_cancels_held_orders_through_fair_and_keeps_the_rest():
+    # Fair fell to 3c, YES bids at 6c/4c stayed under a
+    # slot-guard hold, and a NO ask at 95c sat under the 97c NO fair.
+    bot = _bot(_records())
+    ctx = _swept_ctx(3)
+    _held(ctx, True, Side.BID, 1, 0)
+    _held(ctx, True, Side.BID, 6, 1)
+    _held(ctx, True, Side.BID, 4, 2)
+    _held(ctx, True, Side.ASK, 5, 0)       # fair + 2: allowed
+    _held(ctx, False, Side.ASK, 95, 0)     # NO fair 97: through
+    _held(ctx, False, Side.ASK, 99, 1)
+    _held(ctx, False, Side.BID, 92, 0)
+    assert AvellanedaMarketMaker._sweep_through_fair(bot, ctx) == 3
+    assert [o and o.price for o in ctx.yes_orders.bids] == [1, None, None]
+    assert ctx.yes_orders.asks[0].price == 5
+    assert [o and o.price for o in ctx.no_orders.asks] == [None, 99]
+    assert ctx.no_orders.bids[0].price == 92
+    assert sorted(c.kwargs["price"] for c in bot._client.cancel_order.call_args_list) == [-6, -4]
+    assert bot._cancel_ask.call_args.kwargs["price"] == 95
+    assert bot._cancel_ask.call_args.kwargs["wait"] is True
+
+
+def test_sweep_ask_at_fair_is_cancelled():
+    bot = _bot(_records())
+    ctx = _swept_ctx(95)
+    _held(ctx, True, Side.ASK, 95, 0)
+    _held(ctx, True, Side.ASK, 97, 1)
+    assert AvellanedaMarketMaker._sweep_through_fair(bot, ctx) == 1
+    assert [o and o.price for o in ctx.yes_orders.asks] == [None, 97]
+
+
+def test_sweep_failure_keeps_the_order_tracked_and_not_found_drops_it():
+    bot = _bot(_records())
+    ctx = _swept_ctx(3)
+    _held(ctx, True, Side.BID, 6, 1)
+    bot._client.cancel_order.side_effect = RuntimeError("gateway timeout")
+    assert AvellanedaMarketMaker._sweep_through_fair(bot, ctx) == 0
+    assert ctx.yes_orders.bids[1].price == 6
+    bot._order_state.untrack_order.assert_not_called()
+
+    bot._client.cancel_order.side_effect = RuntimeError(
+        "ERROR: Order not found or does not belong to you")
+    assert AvellanedaMarketMaker._sweep_through_fair(bot, ctx) == 1
+    assert ctx.yes_orders.bids[1] is None
+
+
+def test_quoting_cycle_sweeps_what_the_update_path_left():
+    # Sweep runs after the update path, so atomic moves get first go and
+    # only stuck orders are cancelled (review: sweeping first turned every
+    # fair move into cancel + place).
+    bot = _bot(_records())
+    ctx = MarketContext(config=_cfg())
+    _held(ctx, True, Side.BID, 98, 1)      # far above a ~95c fair, left by the update path
+    calls = []
+    bot._execute_order_updates.side_effect = lambda *a, **k: calls.append(
+        ctx.yes_orders.bids[1] is not None)
+    _process(bot, ctx)
+    assert calls and all(calls)            # update path saw the order first
+    assert ctx.yes_orders.bids[1] is None  # then the sweep cancelled it
