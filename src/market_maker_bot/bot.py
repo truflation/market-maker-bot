@@ -55,9 +55,10 @@ from .bid_budget import BidBudget
 
 logger = logging.getLogger(__name__)
 
-# Seconds after a stream-priced market is pulled during which reconcile
-# leaves it alone (its wait=False pull cancels are still landing).
-FAIR_PULL_RECONCILE_GRACE = 180.0
+# Seconds after a market is pulled (pre-settlement cutoff, or a stream-priced
+# market's decided/stale pull) during which reconcile leaves it alone: the
+# pull's wait=False cancels are still landing.
+PULL_RECONCILE_GRACE = 180.0
 # Seconds between cancel retries on a pulled market that still tracks orders.
 FAIR_PULL_RETRY = 60.0
 
@@ -304,6 +305,10 @@ class AvellanedaMarketMaker:
         # In-flight cancellations (for should_wait_order_cancel_confirmation)
         self._in_flight_cancels: Set[str] = set()
         self._pre_settlement_pulled: Set[int] = set()
+        # When each pre-settlement pull actually ran (this session). Reconcile
+        # counts its grace from here: a pull that runs late (bot down at the
+        # scheduled time) has cancels in flight after the scheduled time.
+        self._pre_settlement_pulled_at: Dict[int, float] = {}
         # Markets whose earnings cutoff has passed and whose resting orders have
         # been pulled THIS session. In-memory on purpose (not persisted): the
         # cutoff timestamp is the deterministic source of truth, so every
@@ -1213,18 +1218,36 @@ class AvellanedaMarketMaker:
             # orphan and double-cancels it - ~60-90 guaranteed not-found
             # failed txs around every daily ladder settle (the recurring
             # ~05:30-06:30 Eggs alert pages, 2026-09-22 diagnosis).
+            # Once the pull's cancels have had PULL_RECONCILE_GRACE to land,
+            # reconcile runs again on a pulled market and treats every order
+            # of ours still resting there as an orphan: the bot means to hold
+            # none, and an order it was not tracking (placed just before a
+            # restart, or a pull cancel that silently failed) would otherwise
+            # rest until settlement. With pull windows of many hours that is
+            # not a minutes-long gap.
             settle_ts_mkt = context.config.settle_time
-            if settle_ts_mkt is not None and time.time() >= (
-                settle_ts_mkt - self.config.pre_settlement_cutoff
-            ):
-                continue
+            now_rc = time.time()
+            in_cutoff = False
+            if settle_ts_mkt is not None:
+                if now_rc >= settle_ts_mkt:
+                    continue
+                pull_at = settle_ts_mkt - self.config.pre_settlement_cutoff
+                if now_rc >= pull_at:
+                    if query_id not in self._pre_settlement_pulled:
+                        continue  # not pulled yet this window: nothing to sweep
+                    pulled_at = max(
+                        pull_at, self._pre_settlement_pulled_at.get(query_id, 0.0)
+                    )
+                    if now_rc < pulled_at + PULL_RECONCILE_GRACE:
+                        continue
+                    in_cutoff = True
             # A stream-priced market pulled moments ago (decided or stale):
             # its wait=False cancels would race this pass. After the grace
             # window reconcile runs again, and with nothing tracked any of
             # our orders still resting there (a cancel that silently failed)
             # are orphans and get cancelled.
             pulled = self._fair_pulled.get(query_id)
-            if pulled is not None and time.time() - pulled[1] < FAIR_PULL_RECONCILE_GRACE:
+            if pulled is not None and time.time() - pulled[1] < PULL_RECONCILE_GRACE:
                 continue
             bids: dict[bool, dict[int, int]] = {True: {}, False: {}}
             asks: dict[bool, dict[int, int]] = {True: {}, False: {}}
@@ -1297,8 +1320,26 @@ class AvellanedaMarketMaker:
                 else:
                     is_active = tracked.price in asks[tracked.outcome]
 
-                if is_active:
+                if is_active and not in_cutoff:
                     tracked_keys.add((tracked.outcome, tracked.is_buy, tracked.price))
+                elif is_active:
+                    # Pulled market: a still-tracked resting order is one
+                    # the pull failed to cancel. Drop it so the orphan pass
+                    # below cancels it.
+                    logger.warning(
+                        f"Periodic reconcile: market {query_id} is pulled but "
+                        f"{'YES' if tracked.outcome else 'NO'} "
+                        f"{'bid' if tracked.is_buy else 'ask'} "
+                        f"{tracked.price}c still rests; cancelling as orphan"
+                    )
+                    self._order_state.untrack_order(
+                        query_id, tracked.outcome, tracked.is_buy,
+                        tracked.price, tracked.level_idx,
+                    )
+                    orders = context.get_orders(tracked.outcome)
+                    level_list = orders.bids if tracked.is_buy else orders.asks
+                    if tracked.level_idx < len(level_list):
+                        level_list[tracked.level_idx] = None
                 else:
                     stale += 1
                     self._order_state.untrack_order(
@@ -1309,6 +1350,11 @@ class AvellanedaMarketMaker:
             # Orphan pass: anything in bids/asks for this wallet that is
             # not in tracked_keys is an orphan. Cancel it. Respect the
             # per-pass cap to avoid a nonce-storm.
+            # Inside a pull window one attempt each, never counted as stuck:
+            # a book read lagging past the grace would otherwise show every
+            # already-cancelled order as an orphan and retry it into the
+            # stuck-orphan restart, again after every restart.
+            orphan_budget = 1 if in_cutoff else ORPHAN_CANCEL_MAX_ATTEMPTS
             orphan_cancels = 0
             for outcome in (True, False):
                 if total_orphans + orphan_cancels >= MAX_CANCELS_PER_PASS:
@@ -1332,9 +1378,10 @@ class AvellanedaMarketMaker:
                     pass_orphans.add(akey)
                     if (
                         self._reconcile_cancel_attempts.get(akey, 0)
-                        >= ORPHAN_CANCEL_MAX_ATTEMPTS
+                        >= orphan_budget
                     ):
-                        stuck_orphans.add(akey)
+                        if not in_cutoff:
+                            stuck_orphans.add(akey)
                         continue
                     try:
                         self._client.cancel_order(
@@ -1360,9 +1407,10 @@ class AvellanedaMarketMaker:
                     pass_orphans.add(akey)
                     if (
                         self._reconcile_cancel_attempts.get(akey, 0)
-                        >= ORPHAN_CANCEL_MAX_ATTEMPTS
+                        >= orphan_budget
                     ):
-                        stuck_orphans.add(akey)
+                        if not in_cutoff:
+                            stuck_orphans.add(akey)
                         continue
                     try:
                         self._client.cancel_order(
@@ -2740,7 +2788,24 @@ class AvellanedaMarketMaker:
                 and side == Side.ASK
                 and self._free_to_sell(context, outcome) < amount
             )
-            if inventory_limited:
+            # An empty level whose target is the 99c ask / 1c bid cap that
+            # another level already quotes: every level wants the cap price
+            # and only one order can rest there, so the book is as thick as
+            # it can be (a NO fair of 97 puts all three ask
+            # levels at 99c; the empty two paged STALL every 5 min).
+            cap_saturated = not benign_hold and (
+                (side == Side.ASK and new_price >= 99)
+                or (side == Side.BID and new_price <= 1)
+            )
+            if cap_saturated:
+                if skips % SLOT_GUARD_STALL_ERROR_EVERY == 0:
+                    logger.info(
+                        f"SLOT GUARD HOLD: market {context.query_id} "
+                        f"{side.value} L{level_idx} empty for {skips} cycles "
+                        f"(target @{new_price}c is the price cap, quoted by "
+                        f"L{owner_lvl})"
+                    )
+            elif inventory_limited:
                 if skips % SLOT_GUARD_STALL_ERROR_EVERY == 0:
                     logger.info(
                         f"SLOT GUARD HOLD: market {context.query_id} "
@@ -3311,6 +3376,7 @@ class AvellanedaMarketMaker:
                     )
                     self._cancel_market_orders(context)
                     self._pre_settlement_pulled.add(context.query_id)
+                    self._pre_settlement_pulled_at[context.query_id] = time.time()
                     self._save_pre_settlement_pulled()
                 return
 

@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from market_maker_bot.bot import (
-    FAIR_PULL_RECONCILE_GRACE,
+    PULL_RECONCILE_GRACE,
     FAIR_PULL_RETRY,
     AvellanedaMarketMaker,
 )
@@ -181,7 +181,7 @@ def test_reconcile_skips_a_just_pulled_market_then_sweeps_it():
     AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
     bot._client.cancel_order.assert_not_called()
 
-    bot._fair_pulled = {qid: ("decided", time.time() - FAIR_PULL_RECONCILE_GRACE - 1)}
+    bot._fair_pulled = {qid: ("decided", time.time() - PULL_RECONCILE_GRACE - 1)}
     AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
     bot._client.cancel_order.assert_called_once_with(
         query_id=qid, outcome=True, price=40, wait=False)

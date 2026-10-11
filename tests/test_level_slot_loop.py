@@ -303,7 +303,8 @@ def _reconcile_bot(settle_time):
     bot._fair_pulled = {}
     bot._cancel_not_found_times = deque()
     bot._bid_budget = MagicMock()
-    bot._pre_settlement_pulled = set()
+    bot._pre_settlement_pulled = {7}
+    bot._pre_settlement_pulled_at = {}
     bot._earnings_pulled_session = set()
     bot._client.get_order_book.return_value = []
     return bot
@@ -582,6 +583,35 @@ def test_empty_ask_level_short_of_shares_holds_quietly(caplog):
     bot._place_ask.assert_not_called()
 
 
+def test_empty_level_at_the_price_cap_holds_quietly(caplog):
+    """A NO fair of 97 put every ask level at 99c; L2
+    held 99c and the empty levels paged STALL every 5 min. One order can
+    rest at the cap, so the book is as thick as it can be."""
+    import logging
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.ASK, 99, 2, "t2", level_idx=2)
+    with caplog.at_level(logging.INFO):
+        for _ in range(300):
+            assert _update(bot, ctx, mgr, 99, amount=2, level_idx=0,
+                           side=Side.ASK) is None
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert any("price cap" in r.message for r in caplog.records)
+
+
+def test_empty_bid_level_at_the_1c_cap_holds_quietly(caplog):
+    import logging
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.BID, 1, 100, "t2", level_idx=2)
+    with caplog.at_level(logging.INFO):
+        for _ in range(300):
+            assert _update(bot, ctx, mgr, 1, amount=100, level_idx=0) is None
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
 def test_empty_ask_level_with_shares_still_escalates(caplog):
     import logging
     bot = _quote_bot()
@@ -600,14 +630,52 @@ def test_empty_ask_level_with_shares_still_escalates(caplog):
 
 # --- reconcile skips the pre-settlement cutoff window (2026-09-22) -----------
 
-def test_reconcile_skips_market_inside_cutoff():
-    """The pull empties a market by design; reconcile orphan-hunting there
-    double-cancels the same orders (~60-90 failed txs per daily settle)."""
-    bot = _reconcile_bot(settle_time=int(time.time()) + 900)  # 15 min out
+def test_reconcile_skips_a_market_just_pulled():
+    """The pull empties a market by design with wait=False cancels;
+    reconcile orphan-hunting there before they land double-cancels the same
+    orders (~60-90 failed txs per daily settle)."""
+    bot = _reconcile_bot(settle_time=int(time.time()) + 1740)  # pulled 60s ago
     bot.config.pre_settlement_cutoff = 1800.0
     AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
     bot._client.get_order_book.assert_not_called()
     bot._client.cancel_order.assert_not_called()
+
+
+_OURS = "0xaa00000000000000000000000000000000000aa0"
+
+
+def test_reconcile_sweeps_a_pulled_market_after_the_grace():
+    # An untracked NO ask from a restart survived
+    # the pull and rested for hours inside the pull window.
+    bot = _reconcile_bot(settle_time=int(time.time()) + 900)  # pulled 15 min ago
+    bot.config.pre_settlement_cutoff = 1800.0
+    bot._client.get_order_book.side_effect = lambda q, o: (
+        [] if o else [{"wallet_address": _OURS, "price": 96, "amount": 2}])
+    AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+    bot._client.cancel_order.assert_called_once_with(
+        query_id=7, outcome=False, price=96, wait=False)
+
+
+def test_reconcile_cancels_a_tracked_order_the_pull_missed():
+    from market_maker_bot.config import MarketConfig
+    from market_maker_bot.market import MarketContext, OrderManager
+    from market_maker_bot.models import Side
+
+    bot = _reconcile_bot(settle_time=int(time.time()) + 900)
+    bot.config.pre_settlement_cutoff = 1800.0
+    ctx = MarketContext(config=MarketConfig(
+        query_id=7, stream_id="s", data_provider="p",
+        settle_time=int(time.time()) + 900))
+    OrderManager(ctx, 0.0, 1e9).record_order(False, Side.ASK, 96, 2, "tx", level_idx=0)
+    bot._markets = {7: ctx}
+    bot._order_state.get_market_orders.return_value = [_tracked(96, 0, outcome=False, is_buy=False)]
+    bot._client.get_order_book.side_effect = lambda q, o: (
+        [] if o else [{"wallet_address": _OURS, "price": 96, "amount": 2}])
+    AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+    bot._order_state.untrack_order.assert_called_once()
+    assert ctx.no_orders.asks[0] is None
+    bot._client.cancel_order.assert_called_once_with(
+        query_id=7, outcome=False, price=96, wait=False)
 
 
 def test_reconcile_runs_outside_cutoff():
@@ -615,3 +683,34 @@ def test_reconcile_runs_outside_cutoff():
     bot.config.pre_settlement_cutoff = 1800.0
     AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
     assert bot._client.get_order_book.call_count == 2
+
+
+def test_reconcile_waits_out_the_grace_after_a_late_pull():
+    # Review: bot down across the scheduled pull, restarts 5 min late and
+    # pulls now; the grace must count from the real pull, or reconcile
+    # re-cancels the in-flight cancels (the #51 storm).
+    bot = _reconcile_bot(settle_time=int(time.time()) + 1500)  # scheduled pull 5 min ago
+    bot.config.pre_settlement_cutoff = 1800.0
+    bot._pre_settlement_pulled_at = {7: time.time()}           # actually pulled just now
+    AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+    bot._client.get_order_book.assert_not_called()
+
+
+def test_reconcile_ignores_a_window_market_not_pulled_yet():
+    bot = _reconcile_bot(settle_time=int(time.time()) + 900)
+    bot.config.pre_settlement_cutoff = 1800.0
+    bot._pre_settlement_pulled = set()
+    AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+    bot._client.get_order_book.assert_not_called()
+
+
+def test_pulled_market_orphans_get_one_attempt_and_never_trigger_the_exit():
+    # Review: a lagging read past the grace shows cancelled orders as
+    # orphans; capped at one cancel each, never counted as stuck.
+    bot = _reconcile_bot(settle_time=int(time.time()) + 900)
+    bot.config.pre_settlement_cutoff = 1800.0
+    book = [{"wallet_address": _OURS, "price": p, "amount": 2} for p in range(60, 75)]
+    bot._client.get_order_book.side_effect = lambda q, o: [] if o else book
+    for _ in range(4):
+        AvellanedaMarketMaker._periodic_reconcile_against_chain(bot)
+    assert bot._client.cancel_order.call_count == len(book)
