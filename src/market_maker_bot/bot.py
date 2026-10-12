@@ -146,6 +146,28 @@ def _compute_base_amount(market_config, price_cents: int) -> int:
     return market_config.order_amount
 
 
+def _lift_to_min_notional(market_config, price_cents: int, amount: int, base: int) -> int:
+    """Round a dollar-sized order up to the protocol minimum notional.
+
+    A dollar-sized order can fall short of the 100 cent-share minimum through
+    share rounding or the inventory-skew (eta) shrink, and was then skipped,
+    leaving books one-sided (at $1.50/level a bid at 47c sized 2 shares =
+    94 < 100 was skipped every pass). It is lifted to
+    ceil(100 / price) shares, but only up to `base`, the order's unskewed
+    dollar-sized share count, so a lift never exceeds what the config already
+    sizes (or the bid budget built from it). The trade-off: at $1.50-$2 per
+    level a lift undoes most of the eta shrink, which at those sizes was too
+    coarse to matter (2 shares to 1); a two-sided book wins. Share-count
+    configs, and orders whose own base is under the minimum, keep the skip.
+    """
+    if getattr(market_config, "order_dollar_amount", None) is None or price_cents <= 0:
+        return amount
+    if _meets_min_notional(price_cents, amount):
+        return amount
+    lifted = -(-MIN_ORDER_NOTIONAL_CENT_SHARES // price_cents)
+    return lifted if lifted <= base else amount
+
+
 def _pair_out_of_order(
     side: "Side", lvl_a: int, price_a: int, lvl_b: int, price_b: int
 ) -> bool:
@@ -2316,19 +2338,25 @@ class AvellanedaMarketMaker:
             # base is rescaled to each level's PRICE so each placed order has
             # the configured dollar notional on the order book (price * amount).
             #
-            # Both legs use the leg price directly. For ASKs at extreme priors
-            # this produces small share counts that may fail the protocol's
-            # split-mint min-notional check on the low leg (split_price *
-            # amount < 100 cent-shares); those orders are skipped at the place
-            # call site rather than inflating amount to clear min, which would
-            # otherwise blow notional far past the user's $X target.
+            # Both legs use the leg price directly. An order that rounding or
+            # the eta shrink pushes under the protocol minimum is lifted to
+            # it when its unskewed size allows; otherwise it is skipped at the
+            # place call site.
             bid_base = _compute_base_amount(context.config, level_bid)
             ask_base = _compute_base_amount(context.config, level_ask)
-            bid_amt = self._apply_eta_transformation(
-                bid_base, pricing.inventory_skew, is_buy=True
+            bid_amt = _lift_to_min_notional(
+                context.config, level_bid,
+                self._apply_eta_transformation(
+                    bid_base, pricing.inventory_skew, is_buy=True
+                ),
+                bid_base,
             )
-            ask_amt = self._apply_eta_transformation(
-                ask_base, pricing.inventory_skew, is_buy=False
+            ask_amt = _lift_to_min_notional(
+                context.config, level_ask,
+                self._apply_eta_transformation(
+                    ask_base, pricing.inventory_skew, is_buy=False
+                ),
+                ask_base,
             )
 
             # Track order pair for hanging orders (first level only)
