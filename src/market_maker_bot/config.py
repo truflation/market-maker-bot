@@ -482,6 +482,10 @@ class BotConfig:
     stream_max_staleness: float = 600.0
     stream_max_record_age: float = 144000.0  # 40h
     stream_lookback_days: int = 200
+    # Once a market is pulled before settlement, burn the complete YES+NO
+    # pairs the bot still holds (YES sell at X + NO sell at 100 - X) for par
+    # instead of carrying them to settlement (winner 98c, loser 0).
+    burn_pairs_on_pull: bool = False
 
 
 def load_config_from_dict(data: dict) -> BotConfig:
@@ -526,4 +530,5 @@ def load_config_from_dict(data: dict) -> BotConfig:
         stream_max_staleness=data.get("stream_max_staleness", 600.0),
         stream_max_record_age=data.get("stream_max_record_age", 144000.0),
         stream_lookback_days=data.get("stream_lookback_days", 200),
+        burn_pairs_on_pull=data.get("burn_pairs_on_pull", False),
     )

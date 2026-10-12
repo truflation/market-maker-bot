@@ -61,6 +61,8 @@ logger = logging.getLogger(__name__)
 PULL_RECONCILE_GRACE = 180.0
 # Seconds between cancel retries on a pulled market that still tracks orders.
 FAIR_PULL_RETRY = 60.0
+# Seconds between pair-burn attempts on one pulled market.
+BURN_RETRY_INTERVAL = 120.0
 
 
 def _has_tracked_orders(context: MarketContext) -> bool:
@@ -309,6 +311,8 @@ class AvellanedaMarketMaker:
         # counts its grace from here: a pull that runs late (bot down at the
         # scheduled time) has cancels in flight after the scheduled time.
         self._pre_settlement_pulled_at: Dict[int, float] = {}
+        # Last pair-burn attempt per pulled market (burn_pairs_on_pull).
+        self._burn_attempt_at: Dict[int, float] = {}
         # Markets whose earnings cutoff has passed and whose resting orders have
         # been pulled THIS session. In-memory on purpose (not persisted): the
         # cutoff timestamp is the deterministic source of truth, so every
@@ -977,6 +981,182 @@ class AvellanedaMarketMaker:
                         f"cancelled"
                     )
         return swept
+
+    def _order_owner_address(self) -> Optional[str]:
+        """Address that owns our orders on chain: the MAA when configured
+        (orders run as the MAA), else the signing key's address."""
+        if getattr(self.config, "maa_address", ""):
+            return self.config.maa_address.strip().lower()
+        try:
+            key = self.config.private_key.strip()
+            if key.startswith("0x"):
+                key = key[2:]
+            if len(key) != 64:
+                return None
+            from eth_account import Account
+            return Account.from_key("0x" + key).address.lower()
+        except Exception:
+            return None
+
+    def _burn_cancel_leg(self, qid: int, outcome: bool, price: int) -> None:
+        """Best-effort cancel of a burn leg that may be resting."""
+        try:
+            self._client.cancel_order(query_id=qid, outcome=outcome, price=price, wait=True)
+        except Exception as e:
+            if not self._is_cancel_not_found(e):
+                logger.warning(
+                    f"PAIR BURN: market {qid} {'YES' if outcome else 'NO'} leg "
+                    f"@{price} cancel failed: {e}"
+                )
+
+    def _burn_reference_fair(self, context: MarketContext) -> int:
+        """Fair YES (cents) to centre a burn on: the stream fair for a
+        stream-priced band (decided bands come out at 3c/97c), else the last
+        quoted fair, else 50."""
+        cfg = context.config
+        if cfg.fair_model:
+            entry = self._stream_series(cfg)
+            if entry is not None:
+                prior = cfg.initial_probability
+                if prior is None or not 0.0 <= prior <= 1.0:
+                    prior = 0.2
+                p, _ = band_fair.band_probability(
+                    entry[0], entry[1], cfg.lower_bound, cfg.upper_bound,
+                    cfg.settle_time, prior,
+                )
+                if p is not None:
+                    return max(1, min(99, int(round(p * 100))))
+        if context.initial_price_yes is not None:
+            return max(1, min(99, int(round(context.initial_price_yes))))
+        return 50
+
+    def _burn_held_pairs(self, context: MarketContext) -> int:
+        """Burn the complete YES+NO pairs held on a pulled market.
+
+        A pair held to settlement pays the winner 98c (2c fee) and the loser
+        0. The chain burns a resting YES sell at X against a NO sell at
+        100 - X for the full 100c with no fee, whoever wins, so a pulled
+        market gives its pairs back at par instead.
+
+        Runs once the pull's cancels have landed and a holdings read has
+        happened since: places a YES sell at X for every held pair, then a
+        NO sell at 100 - X, which match_burn pairs with it. X is chosen near
+        fair (so a leg another wallet takes in between sells near value),
+        above every other wallet's YES bid (and 100 - X above every NO bid)
+        so nothing direct-fills, and off any price where another wallet's
+        ask rests so the burn pairs our own legs. Any of our orders
+        still resting (a leftover leg, a missed pull cancel) are cancelled
+        first and the burn waits for the next attempt. Returns pairs burned.
+        """
+        if self.config.dry_run or self.config.read_only:
+            return 0
+        qid = context.query_id
+        now = time.time()
+        settle = context.config.settle_time
+        # Two wait=True writes can take ~75s each; stay well clear of settle.
+        if settle is not None and now >= settle - 180:
+            return 0
+        pulled_at = self._pre_settlement_pulled_at.get(qid, 0.0)
+        if now - pulled_at < PULL_RECONCILE_GRACE:
+            return 0
+        last = self._burn_attempt_at.get(qid, 0.0)
+        if now - last < BURN_RETRY_INTERVAL:
+            return 0
+        inv = self._inventory.get_market_inventory(qid)
+        if inv.refreshed_at <= max(pulled_at, last):
+            return 0  # wait for a holdings read after the pull / last attempt
+        owner = self._order_owner_address()
+        if owner is None:
+            return 0
+        self._burn_attempt_at[qid] = now
+
+        ours: list = []
+        foreign_bid = {True: 0, False: 0}
+        foreign_asks: Dict[bool, Set[int]] = {True: set(), False: set()}
+        try:
+            for outcome in (True, False):
+                for entry in self._client.get_order_book(qid, outcome):
+                    raw = entry.get("wallet_address")
+                    who = ("0x" + raw.hex()) if isinstance(raw, (bytes, bytearray)) else str(raw)
+                    price = entry.get("price") or 0
+                    if who.lower() == owner:
+                        ours.append((outcome, price))
+                    elif price < 0:
+                        foreign_bid[outcome] = max(foreign_bid[outcome], -price)
+                    elif price > 0:
+                        foreign_asks[outcome].add(price)
+        except Exception as e:
+            logger.warning(f"PAIR BURN: market {qid} book read failed: {e}")
+            return 0
+
+        if ours:
+            # Clear our own leftovers first; the burn retries next attempt.
+            for outcome, price in ours:
+                try:
+                    self._client.cancel_order(
+                        query_id=qid, outcome=outcome, price=price, wait=True
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"PAIR BURN: market {qid} could not clear our "
+                        f"{'YES' if outcome else 'NO'} order @{price}: {e}"
+                    )
+            logger.info(
+                f"PAIR BURN: market {qid} cleared {len(ours)} resting order(s) "
+                f"of ours before burning"
+            )
+            return 0
+
+        # Checked after the clean-up so a leftover leg is always cleared,
+        # even once fewer than 2 pairs remain.
+        pairs = min(inv.free_to_sell(True, []), inv.free_to_sell(False, []))
+        if pairs < 2:
+            return 0
+
+        def ok(x: int) -> bool:
+            return (
+                _meets_min_notional(x, pairs)
+                and _meets_min_notional(100 - x, pairs)
+                and x > foreign_bid[True]
+                and 100 - x > foreign_bid[False]
+                and x not in foreign_asks[True]
+                and 100 - x not in foreign_asks[False]
+            )
+
+        # Centre on fair: if another wallet does take a leg between our two
+        # placements, it buys near value instead of at 50.
+        fair = self._burn_reference_fair(context)
+        price = next((x for x in sorted(range(1, 100), key=lambda v: abs(v - fair)) if ok(x)), None)
+        if price is None:
+            logger.info(
+                f"PAIR BURN: market {qid} no clean price for {pairs} pairs "
+                f"(other YES bid {foreign_bid[True]}, NO bid {foreign_bid[False]})"
+            )
+            return 0
+        try:
+            self._client.place_sell_order(qid, True, price, pairs, wait=True)
+        except Exception as e:
+            # A timed-out write can still land: pull it best-effort.
+            logger.warning(f"PAIR BURN: market {qid} YES leg @{price} x{pairs} failed: {e}")
+            inv.note_unconfirmed_sell(True, price, pairs, time.time())
+            self._burn_cancel_leg(qid, True, price)
+            return 0
+        try:
+            self._client.place_sell_order(qid, False, 100 - price, pairs, wait=True)
+        except Exception as e:
+            logger.warning(
+                f"PAIR BURN: market {qid} NO leg @{100 - price} x{pairs} failed: "
+                f"{e}; pulling both legs"
+            )
+            inv.note_unconfirmed_sell(False, 100 - price, pairs, time.time())
+            self._burn_cancel_leg(qid, True, price)
+            self._burn_cancel_leg(qid, False, 100 - price)
+            return 0
+        logger.info(
+            f"PAIR BURN: market {qid} burned {pairs} pair(s) at "
+            f"{price}/{100 - price} (par, no settlement fee)"
+        )
+        return pairs
 
     def _calculate_initial_price(
         self, market_config: MarketConfig
@@ -3378,6 +3558,8 @@ class AvellanedaMarketMaker:
                     self._pre_settlement_pulled.add(context.query_id)
                     self._pre_settlement_pulled_at[context.query_id] = time.time()
                     self._save_pre_settlement_pulled()
+                elif self.config.burn_pairs_on_pull:
+                    self._burn_held_pairs(context)
                 return
 
         # Stream-priced bands: reprice from the stream every cycle; stop
