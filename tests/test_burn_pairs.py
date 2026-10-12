@@ -27,10 +27,11 @@ def _setup(yes=12, no=12, books=None, settle_in=3600, pulled_ago=600, refreshed_
     bot = MagicMock()
     bot.config = SimpleNamespace(
         dry_run=False, read_only=False, maa_address=OURS, private_key="",
-        burn_pairs_on_pull=True,
+        burn_pairs_on_pull=True, decided_mode=False,
     )
     bot._pre_settlement_pulled_at = {7: now - pulled_ago}
     bot._burn_attempt_at = {}
+    bot._pulled_listings = {}
     inv = MarketInventory(query_id=7)
     inv.update_from_positions(yes_shares=yes, no_shares=no, refreshed_at=now - refreshed_ago)
     bot._inventory.get_market_inventory.return_value = inv
@@ -159,7 +160,8 @@ def test_never_burns_close_to_settle():
 def test_pull_loop_burns_only_markets_already_pulled():
     now = time.time()
     bot = MagicMock()
-    bot.config = SimpleNamespace(pre_settlement_cutoff=1800.0, burn_pairs_on_pull=True)
+    bot.config = SimpleNamespace(pre_settlement_cutoff=1800.0, burn_pairs_on_pull=True,
+                                 decided_mode=False)
     bot._pre_settlement_pulled = {7}
     bot._earnings_pulled_session = set()
     ctx = MarketContext(config=MarketConfig(

@@ -486,6 +486,16 @@ class BotConfig:
     # pairs the bot still holds (YES sell at X + NO sell at 100 - X) for par
     # instead of carrying them to settlement (winner 98c, loser 0).
     burn_pairs_on_pull: bool = False
+    # Once a market is pulled, keep held shares listed instead of idle at
+    # price 0: at 99c (never below settlement value, whatever the outcome),
+    # and once a stream-priced band is decided (record stable for
+    # decided_min_age, value at least decided_edge_margin from every band
+    # edge, in stream units) offer the losing side at decided_loser_ask_cents.
+    # decided_edge_margin None keeps every share at 99c.
+    decided_mode: bool = False
+    decided_loser_ask_cents: int = 3
+    decided_edge_margin: Optional[float] = None
+    decided_min_age: float = 600.0
 
 
 def load_config_from_dict(data: dict) -> BotConfig:
@@ -531,4 +541,8 @@ def load_config_from_dict(data: dict) -> BotConfig:
         stream_max_record_age=data.get("stream_max_record_age", 144000.0),
         stream_lookback_days=data.get("stream_lookback_days", 200),
         burn_pairs_on_pull=data.get("burn_pairs_on_pull", False),
+        decided_mode=data.get("decided_mode", False),
+        decided_loser_ask_cents=data.get("decided_loser_ask_cents", 3),
+        decided_edge_margin=data.get("decided_edge_margin"),
+        decided_min_age=data.get("decided_min_age", 600.0),
     )

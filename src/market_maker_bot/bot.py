@@ -313,6 +313,11 @@ class AvellanedaMarketMaker:
         self._pre_settlement_pulled_at: Dict[int, float] = {}
         # Last pair-burn attempt per pulled market (burn_pairs_on_pull).
         self._burn_attempt_at: Dict[int, float] = {}
+        # decided_mode: our sell per outcome resting on a pulled market
+        # (qid -> {outcome: price}); reconcile leaves these alone. And when a
+        # stream band was first seen decided at its current value.
+        self._pulled_listings: Dict[int, Dict[bool, int]] = {}
+        self._decided_since: Dict[int, Tuple[float, float]] = {}
         # Markets whose earnings cutoff has passed and whose resting orders have
         # been pulled THIS session. In-memory on purpose (not persisted): the
         # cutoff timestamp is the deterministic source of truth, so every
@@ -1030,6 +1035,114 @@ class AvellanedaMarketMaker:
             return max(1, min(99, int(round(context.initial_price_yes))))
         return 50
 
+    def _decided_winner(self, context: MarketContext) -> Optional[bool]:
+        """Winning outcome of a stream-priced band whose deciding record is
+        on chain, has held its value for decided_min_age, and sits at least
+        decided_edge_margin from every band edge; else None.
+
+        Settlement reads the latest record at or before settle and a later
+        revision wins (node 040 attestation), so a decided band is only
+        trusted when a revision would have to move the value further than
+        the margin (revisions can land hours after the original record).
+        """
+        cfg = context.config
+        margin = self.config.decided_edge_margin
+        if not cfg.fair_model or margin is None or margin <= 0:
+            return None
+        entry = self._stream_series(cfg)
+        if entry is None or time.time() - entry[2] > self.config.stream_max_staleness:
+            return None  # cannot see a revision through a stale read
+        # Settlement reads the latest record in [settle - 1 day, settle];
+        # the shared read can hold later records for later rungs.
+        window = [
+            (t, v) for t, v in zip(entry[0], entry[1])
+            if cfg.settle_time - 86400 <= t <= cfg.settle_time
+        ]
+        if not window or band_fair.steps_remaining(window[-1][0], cfg.settle_time) != 0:
+            self._decided_since.pop(context.query_id, None)
+            return None
+        value = window[-1][1]
+        seen = self._decided_since.get(context.query_id)
+        if seen is None or seen[0] != value:
+            self._decided_since[context.query_id] = (value, time.time())
+            return None
+        if time.time() - seen[1] < self.config.decided_min_age:
+            return None
+        edges = [e for e in (cfg.lower_bound, cfg.upper_bound) if e is not None]
+        if any(abs(value - e) < margin for e in edges):
+            return None
+        return band_fair.in_band(value, cfg.lower_bound, cfg.upper_bound)
+
+    def _pulled_targets(self, context: MarketContext) -> Dict[bool, int]:
+        """Ask price per outcome for shares held on a pulled market. 99c by
+        default: a sale at 99 beats settlement (at most 98c) whatever the
+        outcome or any revision. Once the band is safely decided the losing
+        side is offered at decided_loser_ask_cents (worth 0 at settlement)."""
+        winner = self._decided_winner(context)
+        loser_price = int(self.config.decided_loser_ask_cents)
+        return {o: (loser_price if winner is not None and o != winner else 99) for o in (True, False)}
+
+    def _guard_decided_listings(self, context: MarketContext) -> None:
+        """Every cycle: pull a loser listing the stream no longer confirms
+        (a revision, a stale read) at once, without the burn's spacing or
+        holdings gates. Once a revision is public the only buyer of a flipped
+        "loser" at 3c is someone who knows it won."""
+        listed = self._pulled_listings.get(context.query_id)
+        if not listed:
+            return
+        settle = context.config.settle_time
+        if settle is not None and time.time() >= settle:
+            return  # trading is closed; settlement pays the same either way
+        loser_price = int(self.config.decided_loser_ask_cents)
+        stale = [o for o, p in listed.items() if p == loser_price]
+        if not stale:
+            return
+        winner = self._decided_winner(context)
+        for outcome in stale:
+            if winner is not None and outcome != winner:
+                continue  # still confirmed
+            try:
+                self._client.cancel_order(
+                    query_id=context.query_id, outcome=outcome, price=loser_price, wait=True
+                )
+            except Exception as e:
+                if not self._is_cancel_not_found(e):
+                    logger.warning(
+                        f"DECIDED LIST: market {context.query_id} could not pull "
+                        f"unconfirmed {'YES' if outcome else 'NO'}@{loser_price}: {e}"
+                    )
+                    continue
+            listed.pop(outcome, None)
+            logger.warning(
+                f"DECIDED LIST: market {context.query_id} pulled "
+                f"{'YES' if outcome else 'NO'}@{loser_price}: no longer confirmed as the loser"
+            )
+
+    def _list_held_shares(self, context: MarketContext, inv, targets: Dict[bool, int]) -> None:
+        """decided_mode: list unlisted held shares of each outcome at its
+        target price (adds to our resting sell there, which the chain merges)."""
+        qid = context.query_id
+        for outcome in (True, False):
+            price = targets.get(outcome)
+            free = inv.free_to_sell(outcome, [])
+            if price is None or free <= 0 or not _meets_min_notional(price, free):
+                continue
+            try:
+                self._client.place_sell_order(qid, outcome, price, free, wait=True)
+                self._pulled_listings.setdefault(qid, {})[outcome] = price
+                logger.info(
+                    f"DECIDED LIST: market {qid} {'YES' if outcome else 'NO'} "
+                    f"x{free} @{price}c"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"DECIDED LIST: market {qid} {'YES' if outcome else 'NO'} "
+                    f"x{free} @{price}c failed: {e}"
+                )
+                inv.note_unconfirmed_sell(outcome, price, free, time.time())
+                # it may still land: keep reconcile from treating it as an orphan
+                self._pulled_listings.setdefault(qid, {})[outcome] = price
+
     def _burn_held_pairs(self, context: MarketContext) -> int:
         """Burn the complete YES+NO pairs held on a pulled market.
 
@@ -1089,6 +1202,14 @@ class AvellanedaMarketMaker:
             logger.warning(f"PAIR BURN: market {qid} book read failed: {e}")
             return 0
 
+        # decided_mode: our sells at their target price are intended
+        # listings, not leftovers.
+        targets: Dict[bool, int] = {}
+        if self.config.decided_mode:
+            targets = self._pulled_targets(context)
+        listed = {o: p for o, p in ours if p > 0 and targets.get(o) == p}
+        self._pulled_listings[qid] = listed
+        ours = [(o, p) for o, p in ours if listed.get(o) != p]
         if ours:
             # Clear our own leftovers first; the burn retries next attempt.
             for outcome, price in ours:
@@ -1110,7 +1231,9 @@ class AvellanedaMarketMaker:
         # Checked after the clean-up so a leftover leg is always cleared,
         # even once fewer than 2 pairs remain.
         pairs = min(inv.free_to_sell(True, []), inv.free_to_sell(False, []))
-        if pairs < 2:
+        if pairs < 2 or not self.config.burn_pairs_on_pull:
+            if self.config.decided_mode:
+                self._list_held_shares(context, inv, targets)
             return 0
 
         def ok(x: int) -> bool:
@@ -1583,6 +1706,8 @@ class AvellanedaMarketMaker:
                         break
                     if (outcome, False, price) in tracked_keys:
                         continue
+                    if in_cutoff and self._pulled_listings.get(query_id, {}).get(outcome) == price:
+                        continue  # decided_mode listing on a pulled market
                     akey = (query_id, outcome, price)
                     pass_orphans.add(akey)
                     if (
@@ -3558,7 +3683,9 @@ class AvellanedaMarketMaker:
                     self._pre_settlement_pulled.add(context.query_id)
                     self._pre_settlement_pulled_at[context.query_id] = time.time()
                     self._save_pre_settlement_pulled()
-                elif self.config.burn_pairs_on_pull:
+                elif self.config.burn_pairs_on_pull or self.config.decided_mode:
+                    if self.config.decided_mode:
+                        self._guard_decided_listings(context)
                     self._burn_held_pairs(context)
                 return
 
