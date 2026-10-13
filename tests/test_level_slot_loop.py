@@ -565,6 +565,42 @@ def test_three_level_cycle_sorts_pairwise():
     bot._place_ask.assert_not_called()
 
 
+def test_empty_levels_cascade_in_one_cycle():
+    """L0 empty, L1@50, L2@45, targets 50/45/40: L0 takes L1's order, L1
+    takes L2's, L2 places at 40. One placement, zero changes."""
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.BID, 50, 10, "a", level_idx=1)
+    mgr.record_order(True, Side.BID, 45, 10, "b", level_idx=2)
+    for lvl, p in enumerate([50, 45, 40]):
+        _update(bot, ctx, mgr, p, level_idx=lvl)
+    assert [ctx.yes_orders.get_bid(i).tx_hash for i in (0, 1)] == ["a", "b"]
+    assert bot._client.place_buy_order.call_count == 1
+    assert bot._client.place_buy_order.call_args[1]["price"] == 40
+    bot._client.change_bid.assert_not_called()
+
+
+def test_empty_ask_level_short_of_shares_relabels_once_and_stays_quiet(caplog):
+    """Market 773 orientation reversed (L0 empty and short, L1 resting at
+    L0's target): one relabel, then quiet; no ERROR, no cancels."""
+    import logging
+    bot = _quote_bot()
+    bot._free_to_sell.return_value = 0
+    bot._place_ask.return_value = (None, False)
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.ASK, 36, 64, "t1", level_idx=1)
+    with caplog.at_level(logging.INFO):
+        for _ in range(300):
+            _update(bot, ctx, mgr, 36, amount=60, level_idx=0, side=Side.ASK)
+            _update(bot, ctx, mgr, 40, amount=60, level_idx=1, side=Side.ASK)
+    assert ctx.yes_orders.get_ask(0).tx_hash == "t1"
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert sum("LEVEL RELABEL" in r.message for r in caplog.records) == 1
+    bot._cancel_ask.assert_not_called()
+
+
 # --- benign hold vs real stall (2026-09-16, market 787 saturated grid) -------
 
 def test_benign_hold_never_logs_error(caplog):

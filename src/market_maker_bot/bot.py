@@ -3099,9 +3099,9 @@ class AvellanedaMarketMaker:
                 )
                 return None
             # Empty-level relabel: this level has no order and its target is
-            # resting under a FARTHER level's label. Proposals are deduped
-            # per cycle, so that order sits exactly where pricing wants THIS
-            # level; handing it over is the same zero-write bookkeeping fix,
+            # resting under a FARTHER level's label. That order's price IS
+            # this level's target, so it already sits where pricing wants
+            # THIS level; handing it over is the same zero-write bookkeeping fix,
             # and the farther level then places at its own target (Gas q1945
             # 2026-10-13: NO bids tracked L1@1c / L2@3c with L0 empty and
             # targeting 3c, STALL paged every 5 min for a day). Records only
