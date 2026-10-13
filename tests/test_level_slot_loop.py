@@ -115,11 +115,11 @@ def test_place_skipped_when_other_level_owns_slot():
     bot = _quote_bot()
     ctx = _Ctx()
     mgr = _mgr(ctx)
-    mgr.record_order(True, Side.BID, 72, 10, "tx1", level_idx=1)
-    assert _update(bot, ctx, mgr, 72, level_idx=0) is None
+    mgr.record_order(True, Side.BID, 72, 10, "tx0", level_idx=0)
+    assert _update(bot, ctx, mgr, 72, level_idx=1) is None
     bot._client.place_buy_order.assert_not_called()
-    # L1's tracking is untouched.
-    assert ctx.yes_orders.get_bid(1).price == 72
+    # L0's tracking is untouched.
+    assert ctx.yes_orders.get_bid(0).price == 72
 
 
 def test_change_skipped_when_target_slot_owned():
@@ -371,12 +371,12 @@ def test_slot_guard_skip_counter_tracks_and_resets():
     bot = _quote_bot()
     ctx = _Ctx()
     mgr = _mgr(ctx)
-    mgr.record_order(True, Side.BID, 72, 10, "tx1", level_idx=1)
+    mgr.record_order(True, Side.BID, 72, 10, "tx0", level_idx=0)
     for _ in range(3):
-        _update(bot, ctx, mgr, 72, level_idx=0)       # blocked by L1
-    assert bot._slot_guard_skips[(7, True, True, 0)] == 3
-    _update(bot, ctx, mgr, 71, level_idx=0)           # slot free -> proceeds
-    assert (7, True, True, 0) not in bot._slot_guard_skips
+        _update(bot, ctx, mgr, 72, level_idx=1)       # blocked by L0
+    assert bot._slot_guard_skips[(7, True, True, 1)] == 3
+    _update(bot, ctx, mgr, 71, level_idx=1)           # slot free -> proceeds
+    assert (7, True, True, 1) not in bot._slot_guard_skips
 
 
 # --- review round 2: startup dedupe of incident-era duplicate slots ----------
@@ -498,15 +498,55 @@ def test_ordered_pair_is_never_relabeled():
     assert bot._slot_guard_skips[(7, True, True, 0)] == 1
 
 
-def test_untracked_level_targeting_owned_slot_does_not_relabel():
-    """A level with NO current order proposing an occupied price is the
-    place-collision case, not an inversion: plain skip."""
+def test_empty_level_takes_its_target_from_a_farther_level():
+    """An empty level whose target rests under a FARTHER level's label takes
+    that order over locally; the farther level is freed to re-quote."""
     bot = _quote_bot()
     ctx = _Ctx()
     mgr = _mgr(ctx)
     mgr.record_order(True, Side.ASK, 84, 9, "txB", level_idx=1)
     assert _update(bot, ctx, mgr, 84, level_idx=0, side=Side.ASK) is None
-    assert ctx.yes_orders.get_ask(1).price == 84
+    a0 = ctx.yes_orders.get_ask(0)
+    assert (a0.price, a0.amount, a0.tx_hash) == (84, 9, "txB")
+    assert ctx.yes_orders.get_ask(1) is None
+    bot._order_state.untrack_order.assert_called_once_with(7, True, False, 84, 1)
+    tracked = bot._order_state.track_order.call_args[1]
+    assert (tracked["price"], tracked["level_idx"], tracked["order_id"]) == (84, 0, "txB")
+    bot._place_ask.assert_not_called()
+    bot._cancel_ask.assert_not_called()
+
+
+def test_gas_1945_empty_l0_wedge_heals():
+    """Gas q1945, 2026-10-13: NO bids tracked L1@1c / L2@3c, L0 empty and
+    targeting 3c. L0 takes the 3c order; L2's 1c target is held by L1 (nearer
+    the touch), so L2 holds quietly at the cap. Zero cancels."""
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(False, Side.BID, 1, 180, "t1", level_idx=1)
+    mgr.record_order(False, Side.BID, 3, 60, "t2", level_idx=2)
+    _update(bot, ctx, mgr, 3, amount=60, level_idx=0, outcome=False)
+    assert ctx.no_orders.get_bid(0).tx_hash == "t2"
+    assert ctx.no_orders.get_bid(2) is None
+    # Next cycles: L0 consistent, L2's 1c target is owned by nearer L1.
+    for _ in range(300):
+        _update(bot, ctx, mgr, 3, amount=60, level_idx=0, outcome=False)
+        _update(bot, ctx, mgr, 1, amount=180, level_idx=2, outcome=False)
+    assert ctx.no_orders.get_bid(0).tx_hash == "t2"
+    assert ctx.no_orders.get_bid(1).tx_hash == "t1"
+    bot._cancel_bid.assert_not_called()
+
+
+def test_empty_level_never_takes_from_a_nearer_level():
+    """Records only move toward level 0: an empty L1 whose target is L0's
+    price keeps the plain skip (no flap between the two)."""
+    bot = _quote_bot()
+    ctx = _Ctx()
+    mgr = _mgr(ctx)
+    mgr.record_order(True, Side.BID, 72, 10, "tx0", level_idx=0)
+    assert _update(bot, ctx, mgr, 72, level_idx=1) is None
+    assert ctx.yes_orders.get_bid(0).tx_hash == "tx0"
+    assert ctx.yes_orders.get_bid(1) is None
     bot._order_state.track_order.assert_not_called()
 
 
@@ -554,10 +594,10 @@ def test_placement_blocked_still_escalates_to_error(caplog):
     bot = _quote_bot()
     ctx = _Ctx()
     mgr = _mgr(ctx)
-    mgr.record_order(True, Side.BID, 72, 10, "tx1", level_idx=1)
+    mgr.record_order(True, Side.BID, 72, 10, "tx0", level_idx=0)
     with caplog.at_level(logging.INFO):
         for _ in range(150):
-            assert _update(bot, ctx, mgr, 72, level_idx=0) is None
+            assert _update(bot, ctx, mgr, 72, level_idx=1) is None
     assert any(
         r.levelno == logging.ERROR and "SLOT GUARD STALL" in r.message
         for r in caplog.records
@@ -591,10 +631,10 @@ def test_empty_level_at_the_price_cap_holds_quietly(caplog):
     bot = _quote_bot()
     ctx = _Ctx()
     mgr = _mgr(ctx)
-    mgr.record_order(True, Side.ASK, 99, 2, "t2", level_idx=2)
+    mgr.record_order(True, Side.ASK, 99, 2, "t0", level_idx=0)
     with caplog.at_level(logging.INFO):
         for _ in range(300):
-            assert _update(bot, ctx, mgr, 99, amount=2, level_idx=0,
+            assert _update(bot, ctx, mgr, 99, amount=2, level_idx=2,
                            side=Side.ASK) is None
     assert not any(r.levelno >= logging.ERROR for r in caplog.records)
     assert any("price cap" in r.message for r in caplog.records)
@@ -605,10 +645,10 @@ def test_empty_bid_level_at_the_1c_cap_holds_quietly(caplog):
     bot = _quote_bot()
     ctx = _Ctx()
     mgr = _mgr(ctx)
-    mgr.record_order(True, Side.BID, 1, 100, "t2", level_idx=2)
+    mgr.record_order(True, Side.BID, 1, 100, "t0", level_idx=0)
     with caplog.at_level(logging.INFO):
         for _ in range(300):
-            assert _update(bot, ctx, mgr, 1, amount=100, level_idx=0) is None
+            assert _update(bot, ctx, mgr, 1, amount=100, level_idx=2) is None
     assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
