@@ -3098,6 +3098,43 @@ class AvellanedaMarketMaker:
                     f"Quoting resumes next cycle."
                 )
                 return None
+            # Empty-level relabel: this level has no order and its target is
+            # resting under a FARTHER level's label. That order's price IS
+            # this level's target, so it already sits where pricing wants
+            # THIS level; handing it over is the same zero-write bookkeeping fix,
+            # and the farther level then places at its own target (Gas q1945
+            # 2026-10-13: NO bids tracked L1@1c / L2@3c with L0 empty and
+            # targeting 3c, STALL paged every 5 min for a day). Records only
+            # ever move toward level 0, so this cannot flap; an owner nearer
+            # the touch keeps the existing hold/stall handling below.
+            if (
+                current_order is None
+                and owner_order is not None
+                and owner_lvl > level_idx
+            ):
+                order_mgr.swap_levels(outcome, side, level_idx, owner_lvl)
+                is_buy = side == Side.BID
+                self._order_state.untrack_order(
+                    context.query_id, outcome, is_buy,
+                    owner_order.price, owner_lvl,
+                )
+                self._order_state.track_order(
+                    query_id=context.query_id, outcome=outcome, is_buy=is_buy,
+                    price=owner_order.price, amount=owner_order.amount,
+                    order_id=owner_order.tx_hash, level_idx=level_idx,
+                    is_inventory_backed=owner_order.is_inventory_backed,
+                )
+                self._slot_guard_skips.pop(skip_key, None)
+                self._slot_guard_skips.pop(
+                    (context.query_id, outcome, is_buy, owner_lvl), None
+                )
+                logger.warning(
+                    f"LEVEL RELABEL: market {context.query_id} {side.value} "
+                    f"empty L{level_idx} takes L{owner_lvl}@{owner_order.price}c "
+                    f"(its target); relabeled locally (no chain action). "
+                    f"L{owner_lvl} re-quotes at its own target next cycle."
+                )
+                return None
             skips = self._slot_guard_skips.get(skip_key, 0) + 1
             self._slot_guard_skips[skip_key] = skips
             # Benign hold vs real stall. When this level HAS a resting quote
